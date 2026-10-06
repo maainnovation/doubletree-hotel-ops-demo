@@ -1,0 +1,29 @@
+[theme]
+base = "light"
+primaryColor = "#24584B"
+backgroundColor = "#FCFBF8"
+secondaryBackgroundColor = "#F1F0E9"
+textColor = "#22362F"
+linkColor = "#24584B"
+borderColor = "#DEDFD5"
+showWidgetBorder = true
+baseRadius = "12px"
+buttonRadius = "8px"
+font = "sans-serif"
+headingFont = "serif"
+baseFontSize = 15
+headingFontSizes = ["2.5rem", "1.9rem", "1.5rem", "1.1rem", "1rem", "0.9rem"]
+headingFontWeights = [500, 500, 500, 600, 600, 600]
+greenColor = "#367561"
+orangeColor = "#AF7732"
+redColor = "#B24E43"
+grayColor = "#778079"
+chartCategoricalColors = ["#24584B", "#B3935A", "#8FADA2", "#C5C8B8"]
+dataframeHeaderBackgroundColor = "#E9ECE3"
+dataframeHeaderTextColor = "#22362F"
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
