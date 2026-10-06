@@ -1,0 +1,1 @@
+"""Deterministic GM question handling."""
