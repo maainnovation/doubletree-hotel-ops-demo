@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 from services.data_loader import load_demo_data
 from engine.validation import validate_data
-from services.operations import calculate_components
+from services.operations import calculate_components; from engine.housekeeping import room_count_defaults
 from services.approval import approve, invalidate
 from services.audit import record_change
 from services.state_store import StateStore
@@ -48,7 +48,7 @@ if "audit" not in st.session_state: st.session_state.audit = []
 if "chat" not in st.session_state: st.session_state.chat = []
 
 PARAMETER_DEFAULTS = {
-    "checkout_minutes": 22, "stayover_minutes": 10, "inspection_minutes": 3,
+    "checkout_rooms": 150, "stayover_rooms": 150, "checkout_minutes": 22, "stayover_minutes": 10, "inspection_minutes": 3,
     "paid_shift_hours": 8, "break_minutes": 60, "other_duties_minutes": 30,
     "late_release_minutes": 0, "attendant_adjustment": 0,
     "prior_room_nights": 4500, "forecast_room_nights": 7200, "forecast_days": 30,
@@ -216,7 +216,7 @@ if nav == "PARAMETERS":
         a, b = st.columns(2)
         with a.container(border=True):
             st.markdown("#### Room service")
-            st.number_input("Checkout room cleaning (minutes)", min_value=1, max_value=240, step=1, key="param_checkout_minutes", help="Cleaning time used for each checkout room.")
+            st.number_input("Checkout rooms today", min_value=0, max_value=10000, step=1, key="param_checkout_rooms", help="Number of checkout rooms included in the housekeeping plan."); st.number_input("Stayover rooms today", min_value=0, max_value=10000, step=1, key="param_stayover_rooms", help="Number of stayover rooms included in the housekeeping plan."); st.number_input("Checkout room cleaning (minutes)", min_value=1, max_value=240, step=1, key="param_checkout_minutes", help="Cleaning time used for each checkout room.")
             st.number_input("Stayover room cleaning (minutes)", min_value=1, max_value=180, step=1, key="param_stayover_minutes", help="Cleaning time used for each stayover room.")
             st.number_input("Final inspection buffer (minutes)", min_value=0, max_value=120, step=1, key="param_inspection_minutes", help="Added after the final checkout room is cleaned.")
             st.number_input("Late checkout release delay (minutes)", min_value=0, max_value=240, step=5, key="param_late_release_minutes", help="Adds a delay to checkout-room release times.")
