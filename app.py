@@ -18,6 +18,9 @@ from copilot.parameter_chat import parse_change, resolve_change, change_reply
 from services.operations import build_snapshot
 from copilot.responses import housekeeping_response
 from copilot.scenarios import initial_scenarios
+from services.staff_settings import demo_defaults, validate_staff_settings, clean_payload, DEMO_SEED_VERSION
+import json
+import pandas as pd
 
 ROOT = Path(__file__).parent
 load_dotenv(ROOT / ".env")
@@ -41,6 +44,16 @@ except StreamlitSecretNotFoundError:
 WEB_MANAGER_ID = os.getenv("WEB_MANAGER_ID") or st.session_state.setdefault("web_manager_id", uuid.uuid4().hex)
 
 persisted_state = state_store.get_manager(WEB_MANAGER_ID)
+staff_record = state_store.get_staff_settings(WEB_MANAGER_ID)
+if staff_record is None:
+    staff_record = demo_defaults()
+    state_store.save_staff_settings(WEB_MANAGER_ID, staff_record, DEMO_SEED_VERSION, dataset_mode="demo")
+else:
+    staff_record["dataset_mode"] = staff_record.get("_dataset_mode", "operational")
+if "staff_saved" not in st.session_state:
+    st.session_state.staff_saved = {"staff": staff_record["staff"], "settings": staff_record["settings"], "dataset_mode": staff_record.get("dataset_mode", "operational")}
+if "staff_draft" not in st.session_state:
+    st.session_state.staff_draft = clean_payload(st.session_state.staff_saved)
 if "scenarios" not in st.session_state: st.session_state.scenarios = persisted_state["scenarios"]
 if "approval" not in st.session_state: st.session_state.approval = persisted_state["approval"]
 if "pending" not in st.session_state: st.session_state.pending = persisted_state["pending"]
@@ -199,8 +212,8 @@ if load_error or (validation and not validation.is_valid):
     st.info("Add or fix the workbook, then select Sync Hotel Data.")
     st.stop()
 
-nav = st.segmented_control("Navigation", ["TODAY", "PARAMETERS", "AI Chat - My Copilot", "OPERATIONS"],
-    format_func=lambda label: {"TODAY": ":material/dashboard: Today", "PARAMETERS": ":material/tune: Parameters", "OPERATIONS": ":material/room_service: Operations"}.get(label, label),
+nav = st.segmented_control("Navigation", ["TODAY", "PARAMETERS", "STAFF & SETTINGS", "AI Chat - My Copilot", "OPERATIONS"],
+    format_func=lambda label: {"TODAY": ":material/dashboard: Today", "PARAMETERS": ":material/tune: Parameters", "STAFF & SETTINGS": ":material/groups: Staff & Settings", "OPERATIONS": ":material/room_service: Operations"}.get(label, label),
     default="TODAY", label_visibility="collapsed", key="navigation", width="stretch")
 
 if "parameters" not in st.session_state:
@@ -351,6 +364,103 @@ elif nav == "AI Chat - My Copilot":
                     answer = answer_question(prompt, snapshot, history)
         st.session_state.chat.append(("assistant", answer))
         st.rerun()
+elif nav == "STAFF & SETTINGS":
+    st.subheader("Staff & Settings")
+    st.warning("PUBLIC DEMO ONLY · This app has no sign-in. Entries may be stored in the app's SQLite database and can be lost or shared depending on deployment configuration. Use fictional sample data only; never enter real employee identities, availability, time off, or hotel policy.")
+    st.warning("DEMO ASSUMPTIONS · Fictional staff and editable examples. These values are not hotel policy.")
+    st.caption("Changes are saved to this app's SQLite state, separately from the hotel operations workbook. Display names are labels; stable staff IDs identify each employee. This is a maintenance page; the current calculator still reads workbook staff and settings.")
+    current_mode = st.session_state.staff_saved.get("dataset_mode", "operational")
+    if current_mode == "demo":
+        st.info("Dataset state: **DEMO**. The reset action can replace this entire roster and its assumptions.")
+    else:
+        st.warning("Dataset state: **OPERATIONAL**. Demo reset is unavailable for this roster and its assumptions.")
+    if "staff_editor_version" not in st.session_state:
+        st.session_state.staff_editor_version = 0
+    with st.form(f"staff_settings_form_{st.session_state.staff_editor_version}"):
+        staff_tab, settings_tab = st.tabs(["Staff roster", "Operating assumptions"])
+        with staff_tab:
+            draft_frame = pd.DataFrame(st.session_state.staff_draft["staff"])
+            edited_staff = st.data_editor(draft_frame, key=f"staff_rows_{st.session_state.staff_editor_version}", num_rows="dynamic", hide_index=True, width="stretch", column_config={
+                "staff_id": st.column_config.TextColumn("Stable staff ID", required=True),
+                "display_name": st.column_config.TextColumn("Display name", required=True),
+                "role": st.column_config.SelectboxColumn("Role", options=["Housekeeper", "Houseman", "Lobby Staff", "Manager"], required=True),
+                "status": st.column_config.SelectboxColumn("Status", options=["Active", "Inactive"], required=True),
+                "availability_json": st.column_config.TextColumn("Weekly availability (JSON; use explicit start-end times)", width="large"),
+                "requested_time_off": st.column_config.TextColumn("Requested time off (YYYY-MM-DD, comma-separated)"),
+                "shift_pattern": st.column_config.TextColumn("Shift pattern"),
+                "skills": st.column_config.TextColumn("Roles / skills"),
+                "max_weekly_hours": st.column_config.NumberColumn("Weekly hour limit", min_value=0, max_value=168, step=1),
+                "max_daily_hours": st.column_config.NumberColumn("Daily hour limit", min_value=0, max_value=24, step=1),
+                "hourly_cost": st.column_config.NumberColumn("Hourly cost (demo)", min_value=0.0, step=0.5),
+            })
+            st.caption("Use OFF for not scheduled, R/OFF for requested unavailable, BANQUET for non-cleaning duty, and INSPECT for inspection duty. The status meanings are editable below. Unspecified or start-only shift times cannot produce hours.")
+        with settings_tab:
+            settings_draft = deepcopy(st.session_state.staff_draft["settings"])
+            clean = settings_draft["cleaning_standards"]
+            hours = settings_draft["paid_productive_hours"]
+            coverage = settings_draft["minimum_role_coverage"]
+            break_policy = settings_draft["break_policy"]
+            codes = settings_draft["status_codes"]
+            settings_draft["cleaning_standards"]["checkout_minutes"] = st.number_input("Checkout cleaning standard (minutes)", min_value=1, max_value=240, value=int(clean["checkout_minutes"]), key=f"checkout_clean_{st.session_state.staff_editor_version}")
+            settings_draft["cleaning_standards"]["stayover_minutes"] = st.number_input("Stayover cleaning standard (minutes)", min_value=1, max_value=180, value=int(clean["stayover_minutes"]), key=f"stayover_clean_{st.session_state.staff_editor_version}")
+            settings_draft["cleaning_standards"]["stayover_service_policy"] = st.text_input("Stayover service policy (demo assumption)", value=clean["stayover_service_policy"], key=f"stayover_policy_{st.session_state.staff_editor_version}")
+            settings_draft["cleaning_standards"]["inspection_minutes"] = st.number_input("Inspection time (minutes)", min_value=0, max_value=120, value=int(clean["inspection_minutes"]), key=f"inspection_{st.session_state.staff_editor_version}")
+            settings_draft["paid_productive_hours"]["paid_shift_hours"] = st.number_input("Paid shift hours", min_value=0.5, max_value=24.0, value=float(hours["paid_shift_hours"]), step=0.5, key=f"paid_{st.session_state.staff_editor_version}")
+            settings_draft["paid_productive_hours"]["break_minutes"] = st.number_input("Break minutes", min_value=0, max_value=720, value=int(hours["break_minutes"]), key=f"break_{st.session_state.staff_editor_version}")
+            settings_draft["paid_productive_hours"]["other_duties_minutes"] = st.number_input("Other duties (minutes)", min_value=0, max_value=720, value=int(hours["other_duties_minutes"]), key=f"duties_{st.session_state.staff_editor_version}")
+            settings_draft["break_policy"]["break_minutes"] = settings_draft["paid_productive_hours"]["break_minutes"]
+            st.caption("Paid hours and productive hours are tracked separately. Productive time is paid shift time less breaks and other duties.")
+            st.markdown("**Minimum role coverage** — edit the JSON object")
+            coverage_json = st.text_area("Role : minimum staff count", value=json.dumps(coverage, indent=2), key=f"coverage_{st.session_state.staff_editor_version}")
+            st.markdown("**Break policy**")
+            settings_draft["break_policy"]["breaks_required"] = st.checkbox("Breaks required (demo assumption)", value=bool(break_policy.get("breaks_required", True)), key=f"break_required_{st.session_state.staff_editor_version}")
+            settings_draft["break_policy"]["notes"] = st.text_input("Break notes", value=break_policy.get("notes", ""), key=f"break_notes_{st.session_state.staff_editor_version}")
+            st.markdown("**Status-code definitions** — edit the JSON object")
+            status_json = st.text_area("Code : meaning", value=json.dumps(codes, indent=2), key=f"status_codes_{st.session_state.staff_editor_version}")
+            settings_draft["notes"] = st.text_area("Additional demo assumptions", value=settings_draft.get("notes", ""), key=f"settings_notes_{st.session_state.staff_editor_version}")
+            confirm_demo_dataset = st.checkbox("I confirm the entire roster and all settings remain fictional demo data and may be replaced by demo reset.", value=False, key=f"confirm_demo_dataset_{st.session_state.staff_editor_version}")
+        save_clicked = st.form_submit_button("Save changes", type="primary")
+        cancel_clicked = st.form_submit_button("Cancel edits")
+    if save_clicked:
+        candidate = {"staff": edited_staff.to_dict(orient="records"), "settings": settings_draft, "dataset_mode": "demo" if confirm_demo_dataset else "operational"}
+        try:
+            candidate["settings"]["minimum_role_coverage"] = json.loads(coverage_json)
+            candidate["settings"]["status_codes"] = json.loads(status_json)
+        except json.JSONDecodeError as exc:
+            st.error(f"Settings JSON is invalid: {exc.msg} at line {exc.lineno}.")
+        else:
+            errors = validate_staff_settings(candidate)
+            if errors:
+                for error in errors: st.error(error)
+            else:
+                cleaned = clean_payload(candidate)
+                state_store.save_staff_settings(WEB_MANAGER_ID, cleaned, DEMO_SEED_VERSION if cleaned["dataset_mode"] == "demo" else 0, dataset_mode=cleaned["dataset_mode"])
+                st.session_state.staff_saved = cleaned
+                st.session_state.staff_draft = clean_payload(cleaned)
+                st.session_state.staff_editor_version += 1
+                st.success("Staff and settings saved to persistent app storage.")
+                st.rerun()
+    if cancel_clicked:
+        st.session_state.staff_draft = clean_payload(st.session_state.staff_saved)
+        st.session_state.staff_editor_version += 1
+        st.info("Unsaved edits were discarded.")
+        st.rerun()
+    st.divider()
+    st.markdown("#### Reset fictional demo data")
+    stored = state_store.get_staff_settings(WEB_MANAGER_ID) or {}
+    safe_to_reset = stored.get("_dataset_mode") == "demo"
+    if not safe_to_reset:
+        st.caption("Reset is disabled because this roster is not marked as the untouched demo-only dataset.")
+    else:
+        reset_confirmed = st.checkbox("I understand reset restores the fictional demo roster and demo assumptions.", key=f"confirm_staff_demo_reset_{st.session_state.staff_editor_version}")
+        if st.button("Reset demo staff & settings", disabled=not reset_confirmed, type="secondary"):
+            defaults = demo_defaults()
+            state_store.save_staff_settings(WEB_MANAGER_ID, defaults, DEMO_SEED_VERSION, dataset_mode="demo")
+            st.session_state.staff_saved = defaults
+            st.session_state.staff_draft = clean_payload(defaults)
+            st.session_state.staff_editor_version += 1
+            st.success("The demo roster and assumptions were reset.")
+            st.rerun()
 elif nav == "OPERATIONS":
     st.subheader("Operations")
     tab1, tab2 = st.tabs(["Housekeeping", "Bar & inventory"])

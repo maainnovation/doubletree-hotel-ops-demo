@@ -14,7 +14,12 @@ class StateStore:
                 CREATE TABLE IF NOT EXISTS manager_state (manager_id TEXT PRIMARY KEY, scenarios TEXT NOT NULL, pending TEXT, approval TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS webhook_messages (message_id TEXT PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, manager_id TEXT NOT NULL, event_json TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+                CREATE TABLE IF NOT EXISTS staff_settings (manager_id TEXT PRIMARY KEY, payload TEXT NOT NULL, demo_seed_version INTEGER NOT NULL DEFAULT 0, dataset_mode TEXT NOT NULL DEFAULT 'operational', updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
             """)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(staff_settings)")}
+            if "dataset_mode" not in columns:
+                # Existing saved records must be treated conservatively after upgrading.
+                db.execute("ALTER TABLE staff_settings ADD COLUMN dataset_mode TEXT NOT NULL DEFAULT 'operational'")
 
     def _connect(self):
         return sqlite3.connect(self.path, timeout=10)
@@ -46,3 +51,20 @@ class StateStore:
     def mark_message_seen(self, message_id):
         with self._connect() as db:
             db.execute("INSERT OR IGNORE INTO webhook_messages(message_id) VALUES(?)", (message_id,))
+
+    def get_staff_settings(self, manager_id):
+        with self._connect() as db:
+            row = db.execute("SELECT payload,demo_seed_version,dataset_mode FROM staff_settings WHERE manager_id=?", (manager_id,)).fetchone()
+        if not row:
+            return None
+        payload = json.loads(row[0])
+        payload["_demo_seed_version"] = row[1]
+        payload["_dataset_mode"] = row[2]
+        return payload
+
+    def save_staff_settings(self, manager_id, payload, demo_seed_version=0, dataset_mode="operational"):
+        if dataset_mode not in {"demo", "operational"}:
+            raise ValueError("Dataset mode must be 'demo' or 'operational'.")
+        encoded = json.dumps(payload)
+        with self._connect() as db:
+            db.execute("INSERT INTO staff_settings(manager_id,payload,demo_seed_version,dataset_mode) VALUES(?,?,?,?) ON CONFLICT(manager_id) DO UPDATE SET payload=excluded.payload,demo_seed_version=excluded.demo_seed_version,dataset_mode=excluded.dataset_mode,updated_at=CURRENT_TIMESTAMP", (manager_id, encoded, int(demo_seed_version), dataset_mode))
