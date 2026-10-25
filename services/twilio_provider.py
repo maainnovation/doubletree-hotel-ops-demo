@@ -28,15 +28,84 @@ from services.whatsapp_provider import (
 _ACCOUNT = re.compile(r"AC[0-9a-fA-F]{32}")
 _MESSAGE = re.compile(r"(?:SM|MM)[0-9a-fA-F]{32}")
 _JSON_LIMIT = 64 * 1024
+_ERROR_CATEGORIES = frozenset({
+    'unclassified', 'required_contentsid', 'unsupported_mediaurl', 'trial_restriction',
+    'recipient_not_verified', 'sender_not_enabled', 'outside_window', 'media_fetch_or_type_rejected',
+})
+_ERROR_PARAMETERS = ('Body', 'ContentSid', 'From', 'MediaUrl', 'StatusCallback', 'To')
 
 
 class ProviderResourceNotFound(ProviderError):
     """Authenticated read returned 404; not an identity/time validation failure."""
 
 
+def _classify_rejection_message(value):
+    """Return fixed diagnostic labels only; this is not proof of root cause.
+
+    Never return, redact-and-return, or retain arbitrary provider text. Unknown,
+    negated or conflicting reason phrases remain unclassified. Parameter names
+    are vocabulary labels, not parameter values or recommended payload changes.
+    """
+    if not isinstance(value,str) or len(value)>2048:
+        return 'unclassified',()
+    normalized=re.sub(r'\s+',' ',value).strip()
+    text=normalized.casefold()
+    params=[]
+    for name in _ERROR_PARAMETERS:
+        if name in {'Body','From','To'}:
+            present=re.search(r"(?:['\"`]"+name+r"['\"`]|\bparameter\s+"+name+r'\b)',normalized)
+        else:
+            present=re.search(r'\b'+name+r'\b',normalized)
+        if present:
+            params.append(name)
+    mentions=tuple(params)
+    # Do not turn explanatory negations/contradictions into a confident label.
+    if (re.search(r'\b(?:not|never)\s+(?:required|missing|unsupported|unverified|outside)\b',text)
+            or re.search(r'\b(?:is|are)\s+(?:supported|allowed|verified|enabled)\b',text)
+            or re.search(r'\b(?:no|false|if|unless|whether|may|might|example|hypothetical)\b',text)
+            or re.search(r"\b(?:isn|aren|wasn|weren|doesn|didn)['’]t\b",text)
+            or re.search(r'\bnot (?:true|the (?:case|cause|reason))\b',text)):
+        return 'unclassified',mentions
+    patterns={
+        'required_contentsid':(
+            r"\bcontentsid['\"` ]{0,3}(?:parameter )?(?:is required|is missing|must be (?:provided|specified))\b",
+            r"\b(?:missing|required) (?:parameter[: ]*)?['\"` ]{0,3}contentsid\b"),
+        'unsupported_mediaurl':(
+            r"\bmediaurl['\"` ]{0,3}(?:parameter )?is (?:not supported|not allowed|not available|unsupported|prohibited)\b",
+            r"\b(?:unsupported|unexpected|unrecognized) (?:parameter[: ]*)?['\"` ]{0,3}mediaurl\b"),
+        'trial_restriction':(
+            r'\btrial (?:accounts?|users?) (?:do|does) not support\b',
+            r'\btrial accounts? cannot send custom messages\b',
+            r'\b(?:trial account upgrade is required|upgrade (?:your|the) trial account to)\b'),
+        'recipient_not_verified':(
+            r'\b(?:recipient|destination|to number) (?:is not verified|is unverified|must be verified)\b',
+            r'\bunverified (?:recipient|destination|to number)\b'),
+        'sender_not_enabled':(
+            r'\b(?:from (?:number|sender|address)|sender) is (?:not enabled|not configured|not found|not authorized|not associated|not registered)\b',
+            r"\bcould not find a channel with the specified ['\"`]?from['\"`]? address\b"),
+        'outside_window':(
+            r'\boutside (?:the )?(?:24[- ]hour (?:customer service )?|customer service |messaging )window\b',
+            r'\bcustomer service window has expired\b'),
+        'media_fetch_or_type_rejected':(
+            r'\b(?:failed|unable) to (?:fetch|download) (?:the )?(?:media|document|pdf)\b',
+            r'\bunsupported media type\b',
+            r'\b(?:media|document|pdf) (?:has (?:an? )?)?(?:invalid|unsupported) (?:content|mime) type\b'),
+    }
+    matches={name:[match for rule in rules for match in re.finditer(rule,text)]
+             for name,rules in patterns.items()}
+    matched=[name for name,spans in matches.items() if spans]
+    residual=list(text)
+    for spans in matches.values():
+        for match in spans:
+            residual[match.start():match.end()]=' '*(match.end()-match.start())
+    if re.search(r'\b(?:not|never)\b',''.join(residual)):
+        return 'unclassified',mentions
+    return (matched[0] if len(matched)==1 else 'unclassified'),mentions
+
+
 class TwilioRequestRejected(ProviderError):
-    """Confirmed rejection: retain only bounded numeric diagnostics, never body."""
-    def __init__(self, http_status: int, twilio_error_code: int | None = None):
+    """Confirmed rejection: bounded numbers/fixed labels only, never raw text."""
+    def __init__(self, http_status: int, twilio_error_code: int | None = None, *, provider_message=None):
         if type(http_status) is not int or not 300 <= http_status < 500 or http_status in {408,429}:
             raise ValueError("Not a confirmed Twilio rejection status")
         self.http_status=http_status
@@ -45,6 +114,16 @@ class TwilioRequestRejected(ProviderError):
         self.safe_error_code=f"twilio_http_{http_status}"
         if self.twilio_error_code is not None:
             self.safe_error_code+=f"_code_{self.twilio_error_code}"
+        category,params=_classify_rejection_message(provider_message)
+        # Defense in depth: even an altered classifier cannot persist free text.
+        self.provider_error_category=(category if type(category) is str and category in _ERROR_CATEGORIES
+                                      else 'unclassified')
+        self.parameter_mentions=tuple(name for name in _ERROR_PARAMETERS
+                                      if type(params) is tuple and any(type(p) is str and p==name for p in params))
+        self.safe_diagnostic_code=self.safe_error_code
+        if self.provider_error_category!='unclassified' or self.parameter_mentions:
+            self.safe_diagnostic_code+=('_category_'+self.provider_error_category+'_params_'+
+                                       ('+'.join(self.parameter_mentions) or 'none'))
         super().__init__(self.safe_error_code)
 
 
@@ -223,16 +302,18 @@ class TwilioWhatsAppProvider:
                 if not 200 <= response.status_code < 300:
                     if sending and 300 <= response.status_code < 500:
                         # A confirmed rejection is not an uncertain send. Read
-                        # only a bounded numeric code; never retain provider text,
+                        # bounded numeric code/fixed labels; never retain provider text,
                         # body, headers, URLs or credentials in errors/state/logs.
                         error_code=None
+                        provider_message=None
                         try:
                             rejected=json.loads(self._read(response,_JSON_LIMIT))
                             if isinstance(rejected,dict):
                                 error_code=rejected.get("code")
+                                provider_message=rejected.get("message")
                         except (ValueError,RecursionError,ProviderError,httpx.RequestError):
                             pass
-                        raise TwilioRequestRejected(response.status_code,error_code) from None
+                        raise TwilioRequestRejected(response.status_code,error_code,provider_message=provider_message) from None
                     raise ProviderError("Provider rejected or redirected the request.")
                 try:
                     result = json.loads(self._read(response, _JSON_LIMIT))

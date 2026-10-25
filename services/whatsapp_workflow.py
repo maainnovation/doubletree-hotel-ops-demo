@@ -248,7 +248,7 @@ class ForecastWorker:
         except AmbiguousSendError:
             status, code, message_id = "reconciliation_required", "send_outcome_unknown", None
         except TwilioRequestRejected as exc:
-            status, code, message_id = "failed", exc.safe_error_code, None
+            status, code, message_id = "failed", exc.safe_diagnostic_code, None
         except ProviderError:
             status, code, message_id = "failed", "provider_rejected", None
         except Exception:

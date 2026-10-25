@@ -185,10 +185,21 @@ error handling intentionally retained only `provider_rejected`; no response body
 can be recovered from that record. The Console Debugger upgrade gate is respected;
 alternate APIs must not be used to bypass it, and no upgrade is performed.
 
-Subsequent explicitly authorized attempts retain only a validated numeric HTTP
+Subsequent explicitly authorized attempts retain a validated numeric HTTP
 status and optional numeric Twilio code, for example `twilio_http_403_code_21608`
 (illustrative, not the observed error). Provider text, request/response bodies,
 headers, URLs and credentials are never stored in this diagnostic. Bounded
 malformed/truncated diagnostic bodies retain only the confirmed rejection status.
 This does not automatically retry rejected messages or change the existing
 ambiguous-send, rate-limit, service-window or persistent attempt-budget rules.
+
+A later, explicitly authorized diagnostic also examines at most 2,048 characters
+of the JSON `message` in memory and retains only fixed reason-category labels
+and exact allowlisted parameter names. Unknown, negated, conditional or
+conflicting phrases remain `unclassified`; these lossy classifications are not
+proof of provider entitlement or a reason to change the sender or payload. The
+raw prose, parameter values and other JSON fields are never persisted. HTTP
+response/body limits and rejection/retry semantics are unchanged. This revision
+does not schedule a retry: any operator retry requires separate approval, an
+audited compare-and-set of the already-saved outbox and the original durable
+three-attempt cap. There is no fourth attempt or automatic trial upgrade.
