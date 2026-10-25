@@ -29,7 +29,7 @@ def main():
         parser.error("Set WHATSAPP_FORECAST_ENABLED=1 for an explicitly configured synthetic pilot")
     store = WorkflowStore()
     files = PrivateFileStore(os.getenv("WHATSAPP_PRIVATE_STORAGE", root / "data" / "whatsapp-private"))
-    worker = ForecastWorker(store, files, provider_from_env())
+    worker = ForecastWorker(store, files, provider_from_env(), acknowledge_uploads=os.getenv("WHATSAPP_UPLOAD_ACK_ENABLED", "0") == "1")
     try:
         while True:
             print(json.dumps({"mode": "development-fake", **worker.drain_ready()}), flush=True)

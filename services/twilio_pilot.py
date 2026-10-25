@@ -145,13 +145,17 @@ def _persistent_mount(root):
 
 class SyntheticPilotProvider:
     """Transport wrapper enforcing exact bytes, immutable demo state and send budget."""
-    def __init__(self, transport_provider, store, files, config, fixture, *, clock=time.time):
+    def __init__(self, transport_provider, store, files, config, fixture, *, clock=time.time, fresh_run_id=None):
         self.transport_provider,self.store,self.files=transport_provider,store,files
         self.config,self.fixture,self.clock=config,fixture,clock
         self.phone_number_id=config.phone_id
         self.is_live=transport_provider.is_live
         self.fixture_hash=hashlib.sha256(fixture).hexdigest()
         self.settings_hash=_fingerprint(synthetic_settings())
+        self.fresh_run_budget = None
+        if fresh_run_id is not None:
+            from services.twilio_run_budget import FreshRunBudget
+            self.fresh_run_budget = FreshRunBudget(store, config, fresh_run_id, clock=clock)
 
     def assert_active(self):
         if self.clock()>=self.config.approved_until:
@@ -238,10 +242,13 @@ class SyntheticPilotProvider:
             raise ProviderError('Only the exact supplied synthetic PDF is accepted in this isolated test.')
         return data
 
-    def _reserve_send(self,to,key):
+    def _reserve_send(self,to,key,*,kind,text=None):
         self.assert_active()
         if to!=self.config.manager_phone:
             raise ProviderError('Only the explicitly enrolled pilot recipient may be messaged.')
+        if self.fresh_run_budget is not None:
+            self.fresh_run_budget.reserve(key,self.clock(),kind=kind,text=text)
+            return
         with self.store._connect() as db:
             db.row_factory=sqlite3.Row
             db.execute('BEGIN IMMEDIATE')
@@ -256,12 +263,15 @@ class SyntheticPilotProvider:
                 raise ProviderError('Pilot send attempt already reserved; reconcile before resending.') from None
 
     def send_text(self,to,text,idempotency_key):
-        self._reserve_send(to,idempotency_key)
+        self._reserve_send(to,idempotency_key,kind='text',text=text)
         return self.transport_provider.send_text(to,text,idempotency_key)
 
     def send_document(self,to,pdf_bytes,filename,caption,idempotency_key):
-        self._reserve_send(to,idempotency_key)
+        self._reserve_send(to,idempotency_key,kind='document')
         return self.transport_provider.send_document(to,pdf_bytes,filename,caption,idempotency_key)
+
+    def allows_automatic_retry(self,outbox_id):
+        return self.fresh_run_budget is None or self.fresh_run_budget.allows_automatic_retry(outbox_id)
 
 
 @dataclass
@@ -327,6 +337,7 @@ def build_runtime(config: PilotConfig, *, transport=None, clock=time.time):
     publisher=PilotDiagnosticMediaPublisher(store,files,config.origin,approved_until=config.approved_until,clock=clock)
     actual=TwilioWhatsAppProvider(config.account_sid,config.auth_token,config.business_sender,media_publisher=publisher,
                                  status_callback_url=config.callback_url,production_approved=not mocked,transport=transport)
-    provider=SyntheticPilotProvider(actual,store,files,config,fixture,clock=clock)
+    fresh_run_id=os.getenv('PILOT_FRESH_RUN_ID') or None
+    provider=SyntheticPilotProvider(actual,store,files,config,fixture,clock=clock,fresh_run_id=fresh_run_id)
     provider.assert_active()
     return PilotRuntime(config,store,files,publisher,provider,fixture,clock)

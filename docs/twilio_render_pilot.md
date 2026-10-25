@@ -231,3 +231,69 @@ Print only safe status/header checks and hash-equality results, never the URL,
 raw response body or credentials. A request from the Render shell through the
 public hostname verifies that public HTTPS edge path, but is **not** a test from
 an independent network or proof that Twilio itself can download it.
+
+## Opt-in upload acknowledgement, then report
+
+`WHATSAPP_UPLOAD_ACK_ENABLED=1` enables a durable two-stage worker flow. The
+flag defaults to off; enabling it changes the number of outbound messages and
+requires a separately approved sending budget. No reply is sent in the webhook.
+
+1. Verify sender/enrollment, authenticated media, native PDF format, complete
+   week, counts and saved Parameters before queuing a receipt. Invalid or
+   unsupported files get the existing correction response instead, never a
+   false “working on it” promise.
+2. Queue exactly: “Got your PDF. I’m calculating the forecast and will send the
+   report shortly.” The job waits for the provider to accept this acknowledgement.
+3. On a later worker pass, revalidate the input/current settings, calculate and
+   save the versioned roster, then submit its PDF. Provider acceptance is not a
+   delivery confirmation, and physical delivery order is not guaranteed by this
+   application. Locks, shortages, latest Parameters and existing versions retain
+   their original protections.
+
+The outbox is migrated transactionally from one row per job to one row per
+`(job_id,purpose)` (`ack` or `result`). Legacy IDs, values, counters and rowids are
+preserved as `result`; unsupported custom schemas fail closed. Same-message
+redelivery, in-flight same-content uploads and unchanged completed results do
+not repeat the receipt. A genuinely fresh upload after a provably unsent expired
+receipt can replace that abandoned work while retaining its audit. A stale or
+manually edited result can be recalculated on a fresh upload rather than being
+silently suppressed by an old receipt.
+
+Ambiguous sends require reconciliation and are never blindly repeated. A
+rejected/cancelled acknowledgement blocks calculation; window expiry blocks
+outbound sends. Internal calculation recovery has its own five-attempt allowance
+without resetting the total processing audit or any send counter. Terminal
+calculation failure queues a correction instead of a PDF, subject to the same
+identity, service-window and send-budget gates.
+
+### Separately approved fresh two-send run
+
+A paid/otherwise eligible account does not reset the earlier test budget.
+`create_run_approval(store, config, run_id, now)` is an operator-only action after
+explicit approval. It appends a separate `pilot_run_authorizations` record and
+leaves the original three PDF reservations and text diagnostic untouched. Set
+`PILOT_FRESH_RUN_ID` only to that approved record, together with the ACK flag.
+There is no public activation API and no automatically created approval.
+
+This narrow continuation requires the original three reservations to remain
+intact. It snapshots the highest existing job rowid, validates the unchanged
+pilot identity/settings, and expires after at most fifteen minutes without
+extending the existing pilot approval. Only a newly received, authenticated,
+exact-fixture upload after that approval may bind the run. Old failed jobs and
+replayed pre-approval input cannot use it.
+
+The separate `pilot_run_attempts` ledger reserves at most one ACK and one result
+before transport. The result must belong to the same bound job and follow an
+accepted ACK. It may be a correction instead of a PDF if calculation cannot
+finish safely; the operator must report that honestly. No automatic send retries
+are permitted, even for rate limits or connection failures. Ambiguous delivery
+requires reconciliation. A reservation is never reclaimed and no prior counter
+is reset. The two-attempt bound is not a provider billing statement; actual
+charges must be verified separately against the approved monetary ceiling.
+
+ACK/fresh-run revision validation: **963 tests passed, 2 warnings** in the full
+non-OCR run (`--ignore=tests/test_forecast_variants.py`). The 13 unchanged OCR
+variants were not rerun; earlier full-run evidence documents two baseline OCR
+failures. This revision adds 57 ACK tests and 26 fresh-run budget tests.
+Independent workflow, callback-race, migration and fresh-run safety review passed.
+These local results are not a CI or live-delivery claim.

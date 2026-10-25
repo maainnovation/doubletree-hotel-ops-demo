@@ -19,6 +19,79 @@ import uuid
 from services.state_store import StateStore
 
 
+_OUTBOX_FIELDS = (
+    "id TEXT PRIMARY KEY, job_id TEXT NOT NULL, tenant_id TEXT NOT NULL, "
+    "phone_number_id TEXT NOT NULL, recipient TEXT NOT NULL, kind TEXT NOT NULL, "
+    "text TEXT NOT NULL, object_key TEXT, filename TEXT, status TEXT NOT NULL DEFAULT 'pending', "
+    "attempts INTEGER NOT NULL DEFAULT 0, available_at REAL NOT NULL, "
+    "provider_message_id TEXT, error_code TEXT, updated_at REAL NOT NULL"
+)
+_OUTBOX_COLUMNS = (
+    "id", "job_id", "tenant_id", "phone_number_id", "recipient", "kind", "text",
+    "object_key", "filename", "status", "attempts", "available_at",
+    "provider_message_id", "error_code", "updated_at",
+)
+_OUTBOX_SCHEMA = (
+    _OUTBOX_FIELDS + ", purpose TEXT NOT NULL DEFAULT 'result' "
+    "CHECK(purpose IN ('ack','result')), UNIQUE(job_id,purpose)"
+)
+
+
+def _ensure_outbox_purpose_schema(db):
+    """Atomic, serialized upgrade of the known legacy schema; never reset rows.
+
+    The caller holds BEGIN IMMEDIATE. Unknown columns, constraints or dependent
+    objects require an operator migration rather than silently dropping them.
+    """
+    current = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='wa_outbox'").fetchone()
+    if current is None:
+        db.execute("CREATE TABLE wa_outbox (" + _OUTBOX_SCHEMA + ")")
+        return
+
+    def normalized(sql):
+        sql = re.sub(r"(?i)^\s*CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+", "CREATE TABLE ", sql)
+        tokens = re.findall(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|[^\s'\"]+", sql)
+        # Ignore layout/case only outside quoted literals: custom defaults and
+        # constraints must not be mistaken for the recognized schema.
+        return "".join("wa_outbox" if token == '"wa_outbox"' else token
+                       if token.startswith(("'", '"')) else token.lower() for token in tokens)
+
+    legacy_schema = _OUTBOX_FIELDS.replace("job_id TEXT NOT NULL,", "job_id TEXT NOT NULL UNIQUE,", 1)
+    expected_legacy = normalized("CREATE TABLE wa_outbox (" + legacy_schema + ")")
+    expected_current = normalized("CREATE TABLE wa_outbox (" + _OUTBOX_SCHEMA + ")")
+    actual = normalized(current[0])
+    columns = tuple(row[1] for row in db.execute("PRAGMA table_xinfo(wa_outbox)"))
+    if actual == expected_current and columns == _OUTBOX_COLUMNS + ("purpose",):
+        return
+    if actual != expected_legacy or columns != _OUTBOX_COLUMNS:
+        raise ValueError("Unrecognized outbox schema; operator migration required")
+
+    indexes = set()
+    for index in db.execute("PRAGMA index_list(wa_outbox)").fetchall():
+        if index[2] != 1 or index[3] not in {"pk", "u"} or index[4] != 0:
+            raise ValueError("Custom outbox index requires an operator migration")
+        quoted = '"' + index[1].replace('"', '""') + '"'
+        indexes.add((index[3], tuple(row[2] for row in db.execute("PRAGMA index_info(" + quoted + ")"))))
+    if indexes != {("pk", ("id",)), ("u", ("job_id",))}:
+        raise ValueError("Unrecognized outbox indexes; operator migration required")
+    for kind, name, sql in db.execute("SELECT type,name,sql FROM sqlite_master WHERE type IN ('trigger','view')").fetchall():
+        if sql and re.search(r"\bwa_outbox\b", sql, re.IGNORECASE):
+            raise ValueError("Dependent outbox objects require an operator migration")
+    for (table,) in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+        quoted = '"' + table.replace('"', '""') + '"'
+        if any(row[2].lower() == "wa_outbox" for row in db.execute("PRAGMA foreign_key_list(" + quoted + ")")):
+            raise ValueError("Outbox foreign keys require an operator migration")
+    temporary = "wa_outbox_purpose_migration"
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name=?", (temporary,)).fetchone():
+        raise ValueError("Outbox migration name is already in use")
+    db.execute("CREATE TABLE " + temporary + " (" + _OUTBOX_SCHEMA + ")")
+    names = ",".join(_OUTBOX_COLUMNS)
+    # Preserve implicit rowids as well as every explicit field, ID and counter.
+    db.execute("INSERT INTO " + temporary + " (rowid," + names + ",purpose) SELECT rowid," + names + ",'result' FROM wa_outbox")
+    db.execute("DROP TABLE wa_outbox")
+    db.execute("ALTER TABLE " + temporary + " RENAME TO wa_outbox")
+
+
 class PrivateFileStore:
     development_only = True
 
@@ -98,13 +171,12 @@ class WorkflowStore(StateStore):
                 CREATE TABLE IF NOT EXISTS wa_documents (
                     tenant_id TEXT NOT NULL, sender TEXT NOT NULL, source_hash TEXT NOT NULL,
                     job_id TEXT NOT NULL, PRIMARY KEY(tenant_id,sender,source_hash));
-                CREATE TABLE IF NOT EXISTS wa_outbox (
-                    id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE, tenant_id TEXT NOT NULL,
-                    phone_number_id TEXT NOT NULL, recipient TEXT NOT NULL, kind TEXT NOT NULL,
-                    text TEXT NOT NULL, object_key TEXT, filename TEXT, status TEXT NOT NULL DEFAULT 'pending',
-                    attempts INTEGER NOT NULL DEFAULT 0, available_at REAL NOT NULL,
-                    provider_message_id TEXT, error_code TEXT, updated_at REAL NOT NULL);
             """)
+            db.execute("BEGIN IMMEDIATE")
+            _ensure_outbox_purpose_schema(db)
+            job_columns = {row[1] for row in db.execute("PRAGMA table_info(wa_jobs)")}
+            if "ack_base_attempts" not in job_columns:
+                db.execute("ALTER TABLE wa_jobs ADD COLUMN ack_base_attempts INTEGER NOT NULL DEFAULT 0")
             columns = {row[1] for row in db.execute("PRAGMA table_info(wa_tenants)")}
             if "report_profile" not in columns:
                 db.execute("ALTER TABLE wa_tenants ADD COLUMN report_profile TEXT NOT NULL DEFAULT 'canonical_v1'")
@@ -292,26 +364,61 @@ class WorkflowStore(StateStore):
             if incoming != "failed" and rank.get(incoming, -1) < rank.get(row["status"], -1):
                 continue
             db.execute("UPDATE wa_outbox SET status=?,provider_message_id=?,updated_at=? WHERE id=?", ("delivery_failed" if incoming == "failed" else incoming, provider_id, now, row["id"]))
+            WorkflowStore.sync_ack_job(db, row, "delivery_failed" if incoming == "failed" else incoming)
+
+    @staticmethod
+    def sync_ack_job(db, item, status):
+        if item['purpose'] != 'ack':
+            return
+        if status in {'failed','cancelled','delivery_failed'}:
+            db.execute("UPDATE wa_jobs SET status='failed',error_code=?,lease_until=NULL WHERE id=? AND status IN ('awaiting_ack','processing','retry')", ('ack_'+status,item['job_id']))
+        elif status in {'accepted','sent','delivered','read'}:
+            db.execute("UPDATE wa_jobs SET error_code=NULL WHERE id=? AND status='awaiting_ack'", (item['job_id'],))
+        elif status in {'outside_window','reconciliation_required'}:
+            db.execute("UPDATE wa_jobs SET error_code=? WHERE id=? AND status='awaiting_ack'", ('ack_'+status,item['job_id']))
 
     def claim_job(self, now, phone_number_id=None, *, exclude_twilio=False):
         with self._connect() as db:
             db.row_factory = sqlite3.Row
             db.execute("BEGIN IMMEDIATE")
-            db.execute("UPDATE wa_jobs SET status='failed',error_code='processing_attempts_exhausted',lease_until=NULL WHERE status='processing' AND lease_until<? AND attempts>=5 AND (? IS NULL OR phone_number_id=?) AND (?=0 OR phone_number_id NOT LIKE 'twilio:%')", (now, phone_number_id, phone_number_id, exclude_twilio))
-            row = db.execute("SELECT * FROM wa_jobs WHERE ((status IN ('pending','retry') AND available_at<=?) OR (status='processing' AND lease_until<?)) AND attempts<5 AND (? IS NULL OR phone_number_id=?) AND (?=0 OR phone_number_id NOT LIKE 'twilio:%') ORDER BY available_at,id LIMIT 1", (now, now, phone_number_id, phone_number_id, exclude_twilio)).fetchone()
+            exhausted = db.execute("SELECT * FROM wa_jobs WHERE status='processing' AND lease_until<? AND attempts>=5+ack_base_attempts AND (? IS NULL OR phone_number_id=?) AND (?=0 OR phone_number_id NOT LIKE 'twilio:%')", (now,phone_number_id,phone_number_id,exclude_twilio)).fetchall()
+            for stale in exhausted:
+                ack = db.execute("SELECT status FROM wa_outbox WHERE job_id=? AND purpose='ack'", (stale['id'],)).fetchone()
+                if ack and ack['status'] in {'accepted','sent','delivered','read'}:
+                    if not db.execute("SELECT 1 FROM wa_outbox WHERE job_id=? AND purpose='result'", (stale['id'],)).fetchone():
+                        self.add_outbox(db, stale, now, "I received your PDF, but the automatic calculation could not be completed safely. Please review the app or contact the hotel administrator; no report will be sent automatically.")
+                    terminal = 'needs_correction'
+                else:
+                    terminal = 'failed'
+                db.execute("UPDATE wa_jobs SET status=?,error_code='processing_attempts_exhausted',lease_until=NULL WHERE id=?", (terminal,stale['id']))
+            row = db.execute("""SELECT * FROM wa_jobs WHERE (
+                (status IN ('pending','retry') AND available_at<=?)
+                OR (status='awaiting_ack' AND available_at<=? AND EXISTS (
+                    SELECT 1 FROM wa_outbox a WHERE a.job_id=wa_jobs.id AND a.purpose='ack'
+                    AND a.status IN ('accepted','sent','delivered','read')
+                    AND a.tenant_id=wa_jobs.tenant_id AND a.phone_number_id=wa_jobs.phone_number_id
+                    AND a.recipient=wa_jobs.sender))
+                OR (status='processing' AND lease_until<?))
+                AND attempts<5+ack_base_attempts AND (? IS NULL OR phone_number_id=?)
+                AND (?=0 OR phone_number_id NOT LIKE 'twilio:%')
+                ORDER BY available_at,id LIMIT 1""", (now, now, now, phone_number_id, phone_number_id, exclude_twilio)).fetchone()
             if not row:
                 return None
             token = uuid.uuid4().hex
-            db.execute("UPDATE wa_jobs SET status='processing',attempts=attempts+1,lease_until=?,claim_token=? WHERE id=?", (now + 300, token, row["id"]))
+            db.execute("UPDATE wa_jobs SET status='processing',attempts=attempts+1,error_code=NULL,lease_until=?,claim_token=? WHERE id=?", (now + 300, token, row["id"]))
             return dict(row, status="processing", attempts=row["attempts"] + 1, claim_token=token)
 
     def job_failed(self, job, now, code, retry=True):
         with self._connect() as db:
-            db.execute("UPDATE wa_jobs SET status=?,error_code=?,available_at=?,lease_until=NULL WHERE id=? AND claim_token=? AND status='processing'", ("retry" if retry and job["attempts"] < 5 else "failed", code, now + min(3600, 30 * 2 ** job["attempts"]), job["id"], job["claim_token"]))
+            db.execute("UPDATE wa_jobs SET status=?,error_code=?,available_at=?,lease_until=NULL WHERE id=? AND claim_token=? AND status='processing'", ("retry" if retry and job["attempts"] < 5 + job.get('ack_base_attempts',0) else "failed", code, now + min(3600, 30 * 2 ** job["attempts"]), job["id"], job["claim_token"]))
 
     @staticmethod
-    def add_outbox(db, job, now, text, object_key=None, filename=None):
-        db.execute("INSERT INTO wa_outbox(id,job_id,tenant_id,phone_number_id,recipient,kind,text,object_key,filename,available_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (uuid.uuid4().hex, job["id"], job["tenant_id"], job["phone_number_id"], job["sender"], "document" if object_key else "text", text, object_key, filename, now, now))
+    def add_outbox(db, job, now, text, object_key=None, filename=None, purpose="result"):
+        if not isinstance(purpose, str) or purpose not in {"ack", "result"}:
+            raise ValueError("Unsupported outbox purpose")
+        identifier = uuid.uuid4().hex
+        db.execute("INSERT INTO wa_outbox(id,job_id,tenant_id,phone_number_id,recipient,kind,text,object_key,filename,available_at,updated_at,purpose) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (identifier, job["id"], job["tenant_id"], job["phone_number_id"], job["sender"], "document" if object_key else "text", text, object_key, filename, now, now, purpose))
+        return identifier
 
     def rows(self, table):
         """Operator/test inspection only; never exposed by the public HTTP API."""

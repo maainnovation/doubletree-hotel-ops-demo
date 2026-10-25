@@ -7,8 +7,8 @@ from services.twilio_pilot import PilotConfig, build_runtime
 from services.whatsapp_workflow import ForecastWorker
 
 
-def run_worker(runtime, *, once=False):
-    worker=ForecastWorker(runtime.store,runtime.files,runtime.provider,clock=runtime.clock)
+def run_worker(runtime, *, once=False, acknowledge_uploads=False):
+    worker=ForecastWorker(runtime.store,runtime.files,runtime.provider,clock=runtime.clock,acknowledge_uploads=acknowledge_uploads)
     while True:
         runtime.assert_active()
         with runtime.store._connect() as db:
@@ -27,7 +27,7 @@ def main():
         while True:
             time.sleep(60)
     try:
-        run_worker(build_runtime(PilotConfig.from_env()))
+        run_worker(build_runtime(PilotConfig.from_env()),acknowledge_uploads=os.getenv("WHATSAPP_UPLOAD_ACK_ENABLED","0")=="1")
     except KeyboardInterrupt:
         pass
     except Exception:

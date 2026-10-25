@@ -21,12 +21,19 @@ from services.weekly_roster import build_exports, generate_weekly_roster, is_ros
 from services.hotel_parameters import saved_room_capacity
 
 
+UPLOAD_ACK_TEXT = "Got your PDF. I’m calculating the forecast and will send the report shortly."
+_ACK_ACCEPTED = {"accepted", "sent", "delivered", "read"}
+
+
 class ForecastWorker:
-    def __init__(self, store, files, provider, clock=time.time):
+    def __init__(self, store, files, provider, clock=time.time, *, acknowledge_uploads=False):
         if getattr(provider, "is_live", False) and (getattr(store, "development_only", True) or getattr(files, "development_only", True)):
             from services.twilio_pilot import SyntheticPilotProvider
             if not isinstance(provider, SyntheticPilotProvider) or not provider.permits_development_storage(store, files):
                 raise ValueError("Live WhatsApp is blocked with development storage; approved production adapters are required")
+        if not isinstance(acknowledge_uploads, bool):
+            raise ValueError("Acknowledgement enable flag must be boolean")
+        self.acknowledge_uploads = acknowledge_uploads
         self.store, self.files, self.provider, self.clock = store, files, provider, clock
 
     def process_one(self):
@@ -90,17 +97,24 @@ class ForecastWorker:
             source_hash = actual_hash.hex()
             rows = validate_whatsapp_forecast(data, media["mime"], enrolled["hotel_code"], capacity, datetime.fromtimestamp(now, timezone.utc), report_profile=enrolled["report_profile"], hotel_name=enrolled["hotel_name"])
             source_key = self.files.put(job["tenant_id"], data, "pdf")
+            with self.store._connect() as db:
+                already_staged = db.execute("SELECT 1 FROM wa_outbox WHERE job_id=? AND purpose='ack'", (job['id'],)).fetchone()
+            if self.acknowledge_uploads or already_staged:
+                if not self._stage_ack(job, enrolled, rows, source_hash, source_key, saved_settings):
+                    return True
             self._persist_roster(job, enrolled, rows, source_hash, source_key, saved_settings["_settings_revision"])
         except ForecastNeedsCorrection as exc:
             self._correction(job, f"Forecast needs correction: {str(exc)[:1800]} No roster was changed. Resend the corrected complete native-text PDF, or review it in the app.")
         except RetryableProviderError:
-            self.store.job_failed(job, now, "media_temporarily_unavailable")
+            if not self._terminal_ack_failure(job):
+                self.store.job_failed(job, now, "media_temporarily_unavailable")
         except ProviderError:
             self._correction(job, "I could not retrieve that file safely. No roster was changed. Please resend the original native-text PDF; contact the pilot administrator if this repeats.")
         except Exception:
             # Only a non-sensitive error code is persisted; never document text,
             # secrets, employee data or raw provider exception strings.
-            self.store.job_failed(job, now, "processing_error")
+            if not self._terminal_ack_failure(job):
+                self.store.job_failed(job, now, "processing_error")
         return True
 
     def _correction(self, job, text):
@@ -119,6 +133,98 @@ class ForecastWorker:
     @staticmethod
     def _owns_job(db, job):
         return db.execute("SELECT 1 FROM wa_jobs WHERE id=? AND claim_token=? AND status='processing'", (job["id"], job["claim_token"])).fetchone() is not None
+
+    def _terminal_ack_failure(self, job):
+        if job['attempts'] < 5 + job.get('ack_base_attempts',0):
+            return False
+        with self.store._connect() as db:
+            ack = db.execute("SELECT status FROM wa_outbox WHERE job_id=? AND purpose='ack'", (job['id'],)).fetchone()
+        if not ack or ack[0] not in _ACK_ACCEPTED:
+            return False
+        self._correction(job, "I received your PDF, but the automatic calculation could not be completed safely. Please review the app or contact the hotel administrator; no report will be sent automatically.")
+        return True
+
+    def _stage_ack(self, job, enrolled, rows, digest, source_key, settings):
+        """Validate first, commit one receipt, then wait for provider acceptance.
+
+        No network or calculation in this transaction. A restart revalidates the
+        immutable input and current settings, but never recreates an existing ACK.
+        """
+        now = self.clock()
+        revision = settings['_settings_revision']
+        staff = {key:value for key,value in settings.items() if not key.startswith('_')}
+        staff['dataset_mode'] = settings['_dataset_mode']
+        with self.store._connect() as db:
+            db.row_factory = sqlite3.Row
+            db.execute('BEGIN IMMEDIATE')
+            if not self._owns_job(db, job):
+                return False
+            current = self.store._enrollment(db, job['phone_number_id'], job['sender'])
+            if not current or self.store.enrollment_binding(current) != self.store.enrollment_binding(enrolled):
+                raise ForecastNeedsCorrection('The enrolled hotel setup changed; ask the administrator to review it before resending.')
+            if not 0 <= now-current['last_inbound'] < 86400:
+                db.execute("UPDATE wa_jobs SET status='failed',error_code='ack_window_expired',lease_until=NULL WHERE id=?", (job['id'],))
+                return False
+            saved = db.execute('SELECT revision,dataset_mode FROM staff_settings WHERE manager_id=?', (enrolled['manager_id'],)).fetchone()
+            if not saved or saved['dataset_mode']!='demo' or saved['revision']!=revision:
+                raise ValueError('Saved settings changed during acknowledgement admission')
+            ack = db.execute("SELECT * FROM wa_outbox WHERE job_id=? AND purpose='ack'", (job['id'],)).fetchone()
+            origin = db.execute('SELECT source_hash,media_json FROM wa_jobs WHERE id=?', (job['id'],)).fetchone()
+            metadata = json.loads(origin['media_json'])
+            if ack:
+                if origin['source_hash']!=digest:
+                    raise ForecastNeedsCorrection('The source file changed after acknowledgement; resend the original complete PDF.')
+                if ack['status'] in _ACK_ACCEPTED:
+                    metadata['_upload_ack_settings_revision'] = revision
+                    db.execute('UPDATE wa_jobs SET media_json=? WHERE id=?', (json.dumps(metadata),job['id']))
+                    return True
+                blocked_status = 'failed' if ack['status'] in {'failed','cancelled','delivery_failed'} else 'awaiting_ack'
+                db.execute("UPDATE wa_jobs SET status=?,lease_until=NULL,error_code=? WHERE id=?", (blocked_status,'ack_'+ack['status'],job['id']))
+                return False
+            if self._reuse_previous_result(db, job, enrolled, rows, digest, staff, now):
+                return False
+            # Serializing this lookup with insertion also covers a duplicate file
+            # arriving under a DIFFERENT provider message ID before calculation.
+            prior = db.execute("SELECT j.id,j.media_json,o.id AS ack_id,o.status AS ack_status,o.provider_message_id FROM wa_jobs j JOIN wa_outbox o ON o.job_id=j.id AND o.purpose='ack' WHERE j.status IN ('awaiting_ack','processing','retry') AND o.status NOT IN ('failed','cancelled','delivery_failed') AND j.tenant_id=? AND j.sender=? AND j.phone_number_id=? AND j.source_hash=? AND j.id<>?", (job['tenant_id'],job['sender'],job['phone_number_id'],digest,job['id'])).fetchall()
+            for previous in prior:
+                prior_meta=json.loads(previous['media_json'])
+                if (prior_meta.get('_enrollment_binding')==self.store.enrollment_binding(enrolled)
+                        and prior_meta.get('_upload_ack_settings_revision')==revision):
+                    if previous['ack_status']=='outside_window' and previous['provider_message_id'] is None:
+                        db.execute("UPDATE wa_outbox SET status='cancelled',error_code='superseded_by_fresh_upload',updated_at=? WHERE id=?", (now,previous['ack_id']))
+                        db.execute("UPDATE wa_jobs SET status='failed',error_code='ack_window_expired',lease_until=NULL WHERE id=?", (previous['id'],))
+                        metadata['_ack_supersedes_job_id']=previous['id']
+                        continue
+                    db.execute("UPDATE wa_jobs SET status='duplicate',source_hash=?,source_key=?,lease_until=NULL WHERE id=?", (digest,source_key,job['id']))
+                    return False
+            metadata['_upload_ack_settings_revision'] = revision
+            self.store.add_outbox(db, job, now, UPLOAD_ACK_TEXT, purpose='ack')
+            db.execute("UPDATE wa_jobs SET status='awaiting_ack',ack_base_attempts=attempts,source_hash=?,source_key=?,media_json=?,lease_until=NULL WHERE id=?", (digest,source_key,json.dumps(metadata),job['id']))
+            return False
+
+    def _reuse_previous_result(self, db, job, enrolled, rows, digest, staff, now):
+        duplicate = db.execute("SELECT d.job_id FROM wa_documents d JOIN wa_jobs j ON j.id=d.job_id WHERE d.tenant_id=? AND d.sender=? AND d.source_hash=? AND j.phone_number_id=?", (job["tenant_id"], job["sender"], digest, job["phone_number_id"])).fetchone()
+        if duplicate:
+            previous_job = db.execute("SELECT media_json,week_start,version FROM wa_jobs WHERE id=?", (duplicate["job_id"],)).fetchone()
+            previous_binding = json.loads(previous_job["media_json"]).get("_enrollment_binding") if previous_job else None
+            if previous_binding != self.store.enrollment_binding(enrolled):
+                raise ForecastNeedsCorrection("This file was previously processed under different hotel setup. Ask the administrator to review the existing version; an old PDF reply will not be reused.")
+            previous_roster_row = db.execute("SELECT payload,version FROM weekly_rosters WHERE manager_id=? AND week_start=?", (enrolled["manager_id"], previous_job["week_start"])).fetchone()
+            previous_roster = json.loads(previous_roster_row["payload"]) if previous_roster_row else None
+            previous_reply = db.execute("SELECT kind,status FROM wa_outbox WHERE job_id=? AND purpose='result'", (duplicate["job_id"],)).fetchone()
+            previous_ack = db.execute("SELECT status,tenant_id,phone_number_id,recipient FROM wa_outbox WHERE job_id=? AND purpose='ack'", (duplicate['job_id'],)).fetchone()
+            ack_reusable = previous_ack is None or (previous_ack['status'] in _ACK_ACCEPTED
+                and previous_ack['tenant_id']==job['tenant_id'] and previous_ack['phone_number_id']==job['phone_number_id']
+                and previous_ack['recipient']==job['sender'])
+            reusable_reply = ack_reusable and previous_reply and previous_reply["kind"] == "document" and previous_reply["status"] in {"pending", "retry", "outside_window", "sending", "accepted", "sent", "delivered", "read", "reconciliation_required"}
+            unchanged = reusable_reply and previous_roster_row and previous_roster_row["version"] == previous_job["version"] and is_roster_current(previous_roster, rows, staff)
+            if unchanged:
+                # Reopen only a provably-unsent, unchanged result. The same
+                # file with changed saved Parameters/staff creates a new version.
+                db.execute("UPDATE wa_outbox SET status='pending',error_code=NULL,available_at=?,updated_at=? WHERE job_id=? AND tenant_id=? AND recipient=? AND purpose='result' AND status='outside_window'", (now, now, duplicate["job_id"], job["tenant_id"], job["sender"]))
+                db.execute("UPDATE wa_jobs SET status='duplicate',source_hash=?,lease_until=NULL WHERE id=?", (digest, job["id"]))
+                return True
+        return False
 
     def _persist_roster(self, job, enrolled, rows, digest, source_key, settings_revision):
         now = self.clock()
@@ -144,23 +250,8 @@ class ForecastWorker:
                 raise ValueError("Saved Parameters/staff changed during validation; retry against the latest revision")
             staff = json.loads(staff_row["payload"])
             staff["dataset_mode"] = staff_row["dataset_mode"]
-            duplicate = db.execute("SELECT d.job_id FROM wa_documents d JOIN wa_jobs j ON j.id=d.job_id WHERE d.tenant_id=? AND d.sender=? AND d.source_hash=? AND j.phone_number_id=?", (job["tenant_id"], job["sender"], digest, job["phone_number_id"])).fetchone()
-            if duplicate:
-                previous_job = db.execute("SELECT media_json,week_start,version FROM wa_jobs WHERE id=?", (duplicate["job_id"],)).fetchone()
-                previous_binding = json.loads(previous_job["media_json"]).get("_enrollment_binding") if previous_job else None
-                if previous_binding != self.store.enrollment_binding(enrolled):
-                    raise ForecastNeedsCorrection("This file was previously processed under different hotel setup. Ask the administrator to review the existing version; an old PDF reply will not be reused.")
-                previous_roster_row = db.execute("SELECT payload,version FROM weekly_rosters WHERE manager_id=? AND week_start=?", (enrolled["manager_id"], previous_job["week_start"])).fetchone()
-                previous_roster = json.loads(previous_roster_row["payload"]) if previous_roster_row else None
-                previous_reply = db.execute("SELECT kind,status FROM wa_outbox WHERE job_id=?", (duplicate["job_id"],)).fetchone()
-                reusable_reply = previous_reply and previous_reply["kind"] == "document" and previous_reply["status"] in {"pending", "retry", "outside_window", "sending", "accepted", "sent", "delivered", "read", "reconciliation_required"}
-                unchanged = reusable_reply and previous_roster_row and previous_roster_row["version"] == previous_job["version"] and is_roster_current(previous_roster, rows, staff)
-                if unchanged:
-                    # Reopen only a provably-unsent, unchanged result. The same
-                    # file with changed saved Parameters/staff creates a new version.
-                    db.execute("UPDATE wa_outbox SET status='pending',error_code=NULL,available_at=?,updated_at=? WHERE job_id=? AND tenant_id=? AND recipient=? AND status='outside_window'", (now, now, duplicate["job_id"], job["tenant_id"], job["sender"]))
-                    db.execute("UPDATE wa_jobs SET status='duplicate',source_hash=?,lease_until=NULL WHERE id=?", (digest, job["id"]))
-                    return
+            if self._reuse_previous_result(db, job, enrolled, rows, digest, staff, now):
+                return
             week_start = rows[0]["date"]
             prior_row = db.execute("SELECT payload,version FROM weekly_rosters WHERE manager_id=? AND week_start=?", (enrolled["manager_id"], week_start)).fetchone()
             prior = dict(json.loads(prior_row["payload"]), version=prior_row["version"]) if prior_row else None
@@ -209,18 +300,36 @@ class ForecastWorker:
             enrolled = self.store._enrollment(db, item["phone_number_id"], item["recipient"])
             if not enrolled or enrolled["tenant_id"] != item["tenant_id"]:
                 db.execute("UPDATE wa_outbox SET status='cancelled',error_code='enrollment_revoked',updated_at=? WHERE id=?", (now, item["id"]))
+                self.store.sync_ack_job(db, item, 'cancelled')
                 return True
             origin = db.execute("SELECT media_json,week_start,version FROM wa_jobs WHERE id=?", (item["job_id"],)).fetchone()
+            if item['purpose'] == 'result':
+                ack = db.execute("SELECT status FROM wa_outbox WHERE job_id=? AND purpose='ack'", (item['job_id'],)).fetchone()
+                if ack and ack['status'] not in _ACK_ACCEPTED:
+                    db.execute("UPDATE wa_outbox SET status='cancelled',error_code='ack_not_accepted',updated_at=? WHERE id=?", (now,item['id']))
+                    self.store.sync_ack_job(db, item, 'cancelled')
+                    return True
+            if item['purpose'] == 'ack':
+                metadata=json.loads(origin['media_json']) if origin else {}
+                current=db.execute('SELECT revision,dataset_mode FROM staff_settings WHERE manager_id=?', (enrolled['manager_id'],)).fetchone()
+                if (metadata.get('_enrollment_binding')!=self.store.enrollment_binding(enrolled)
+                        or not current or current['dataset_mode']!='demo'
+                        or current['revision']!=metadata.get('_upload_ack_settings_revision')):
+                    db.execute("UPDATE wa_outbox SET status='cancelled',error_code='ack_setup_changed',updated_at=? WHERE id=?", (now,item['id']))
+                    self.store.sync_ack_job(db, item, 'cancelled')
+                    return True
             if item["kind"] == "document":
                 binding = json.loads(origin["media_json"]).get("_enrollment_binding") if origin else None
                 if binding != self.store.enrollment_binding(enrolled):
                     db.execute("UPDATE wa_outbox SET status='cancelled',error_code='enrollment_changed',updated_at=? WHERE id=?", (now, item["id"]))
+                    self.store.sync_ack_job(db, item, 'cancelled')
                     return True
                 current = db.execute("SELECT payload,dataset_mode FROM staff_settings WHERE manager_id=?", (enrolled["manager_id"],)).fetchone()
                 latest = db.execute("SELECT payload,version FROM weekly_rosters WHERE manager_id=? AND week_start=?", (enrolled["manager_id"], origin["week_start"])).fetchone()
                 latest_roster = json.loads(latest["payload"]) if latest else None
                 if not current or current["dataset_mode"] != "demo":
                     db.execute("UPDATE wa_outbox SET status='cancelled',error_code='settings_unavailable',updated_at=? WHERE id=?", (now, item["id"]))
+                    self.store.sync_ack_job(db, item, 'cancelled')
                     return True
                 if not latest or latest["version"] != origin["version"] or not is_roster_current(latest_roster, latest_roster["forecast"], json.loads(current["payload"])):
                     item.update(kind="text", object_key=None, filename=None, text="Saved Parameters, staff or roster changed before this PDF could be sent. No outdated PDF was sent. Please resend the forecast to recalculate using the current saved settings.")
@@ -228,9 +337,11 @@ class ForecastWorker:
             provider_phone = getattr(self.provider, "phone_number_id", item["phone_number_id"])
             if provider_phone != item["phone_number_id"]:
                 db.execute("UPDATE wa_outbox SET status='cancelled',error_code='provider_number_mismatch',updated_at=? WHERE id=?", (now, item["id"]))
+                self.store.sync_ack_job(db, item, 'cancelled')
                 return True
             if now - enrolled["last_inbound"] >= 24 * 3600 or enrolled["last_inbound"] > now:
                 db.execute("UPDATE wa_outbox SET status='outside_window',error_code='approved_template_required',updated_at=? WHERE id=?", (now, item["id"]))
+                self.store.sync_ack_job(db, item, 'outside_window')
                 return True
             db.execute("UPDATE wa_outbox SET status='sending',attempts=attempts+1,updated_at=? WHERE id=?", (now, item["id"]))
         try:
@@ -243,7 +354,8 @@ class ForecastWorker:
                 raise AmbiguousSendError("No send receipt")
             status, code = "accepted", None  # Not equivalent to delivered.
         except RetryableProviderError:
-            status = "retry" if item["attempts"] + 1 < 5 else "failed"
+            retry_allowed = getattr(self.provider, 'allows_automatic_retry', lambda key: True)(item['id'])
+            status = "retry" if retry_allowed and item["attempts"] + 1 < 5 else "failed"
             code, message_id = "safe_presend_retry", None
         except AmbiguousSendError:
             status, code, message_id = "reconciliation_required", "send_outcome_unknown", None
@@ -257,6 +369,7 @@ class ForecastWorker:
             status, code, message_id = "reconciliation_required", "send_outcome_unknown", None
         with self.store._connect() as db:
             db.execute("UPDATE wa_outbox SET status=?,error_code=?,provider_message_id=?,available_at=?,updated_at=? WHERE id=? AND status='sending'", (status, code, message_id, now + min(3600, 30 * 2 ** (item["attempts"] + 1)), now, item["id"]))
+            self.store.sync_ack_job(db, item, status)
         return True
 
     def drain_ready(self, limit=100):
