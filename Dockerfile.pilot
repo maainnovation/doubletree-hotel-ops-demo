@@ -1,0 +1,33 @@
+# Isolated synthetic pilot only. Building this image does not enable live use.
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PORT=10000 \
+    PILOT_ENABLED=0 \
+    PILOT_VOLUME_CONFIRMED=0 \
+    PILOT_DATA_ROOT=/var/data/whatsapp-pilot
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates fonts-liberation \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1000 pilot \
+    && useradd --uid 1000 --gid 1000 --create-home --shell /usr/sbin/nologin pilot \
+    && mkdir -p /var/data /app \
+    && chown 1000:1000 /var/data \
+    && chmod 0700 /var/data
+
+WORKDIR /app
+COPY requirements-pilot.txt ./requirements-pilot.txt
+RUN python -m pip install --no-cache-dir -r requirements-pilot.txt
+
+# Deliberately do not COPY the whole repository, workbook, .env, or local data.
+# Root-owned source is read-only to the runtime user; state belongs on the disk.
+COPY api ./api
+COPY services ./services
+COPY scripts ./scripts
+
+USER 1000:1000
+EXPOSE 10000
+CMD ["python", "-m", "scripts.run_twilio_pilot"]

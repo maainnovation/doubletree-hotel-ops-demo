@@ -151,3 +151,8 @@ The same forecast/roster workflow also has a Twilio adapter with signed form
 webhooks, account/sender-bound media, expiring private PDF access and mocked
 end-to-end coverage. It does not establish this account's trial PDF eligibility.
 See [Twilio implementation, demo and live gates](docs/twilio_pdf_workflow.md).
+
+A separately deployed, strictly bounded [Render synthetic pilot](docs/twilio_render_pilot.md)
+is also prepared. It admits only its generated fixture, one enrolled sender and
+three total outbound attempts; it stays disabled until hosting, secrets and the
+real-message test are explicitly approved. It is not production hotel onboarding.

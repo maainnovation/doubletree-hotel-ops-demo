@@ -213,7 +213,7 @@ class WorkflowStore(StateStore):
                             db.execute("UPDATE wa_senders SET last_inbound=MAX(last_inbound,?) WHERE phone_number_id=? AND sender=?", (min(timestamp, now), phone_id, sender))
         return accepted
 
-    def ingest_twilio(self, form, now: float, *, account_sid: str, business_sender: str) -> int:
+    def ingest_twilio(self, form, now: float, *, account_sid: str, business_sender: str, max_jobs=None) -> int:
         """Signed form envelope only. No fetch; receipt time never opens a send window.
 
         Twilio does not sign a timestamp. The worker must verify the immutable
@@ -235,6 +235,9 @@ class WorkflowStore(StateStore):
             enrolled = self._enrollment(db, phone_id, sender)
             if not enrolled:
                 return 0
+            if max_jobs is not None and not db.execute("SELECT 1 FROM wa_jobs WHERE phone_number_id=? AND message_id=?", (phone_id, message_id)).fetchone():
+                if not isinstance(max_jobs, int) or isinstance(max_jobs, bool) or not 1 <= max_jobs <= 100 or db.execute("SELECT COUNT(*) FROM wa_jobs").fetchone()[0] >= max_jobs:
+                    raise ValueError("Pilot intake limit reached")
             media = {"type": "unsupported", "_provider": "twilio"}
             if form.get("NumMedia") == "1":
                 url, mime = form.get("MediaUrl0", ""), form.get("MediaContentType0", "")

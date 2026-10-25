@@ -23,7 +23,9 @@ from services.hotel_parameters import saved_room_capacity
 class ForecastWorker:
     def __init__(self, store, files, provider, clock=time.time):
         if getattr(provider, "is_live", False) and (getattr(store, "development_only", True) or getattr(files, "development_only", True)):
-            raise ValueError("Live WhatsApp is blocked with development storage; approved production adapters are required")
+            from services.twilio_pilot import SyntheticPilotProvider
+            if not isinstance(provider, SyntheticPilotProvider) or not provider.permits_development_storage(store, files):
+                raise ValueError("Live WhatsApp is blocked with development storage; approved production adapters are required")
         self.store, self.files, self.provider, self.clock = store, files, provider, clock
 
     def process_one(self):

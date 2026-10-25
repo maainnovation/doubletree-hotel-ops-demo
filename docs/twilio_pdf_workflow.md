@@ -25,8 +25,8 @@ messages or account-specific PDF entitlement were used to implement this adapter
    can be replayed. Old/mismatched messages fail without sending. Message SID
    uniqueness suppresses replay; content hashes suppress unchanged duplicates.
 4. Fetch media with authenticated, bounded HTTPS and exact MIME. Only canonical
-   own-account Twilio API media URLs are permitted; redirects are rejected, not
-   followed with credentials. Twilio supplies no signed media checksum, so the
+   own-account Twilio API media URLs are permitted. One secured CDN redirect is
+   allowed without credentials, as detailed below. Twilio supplies no signed media checksum, so the
    source hash is computed and retained after download rather than invented.
 5. Reuse strict native-PDF validation, latest shared saved Parameters/staff,
    versioned roster history, locks/manual assignments and shortage reporting.
@@ -83,9 +83,19 @@ values in browser code, commit them, or log webhook bodies/URLs/media tokens.
 - Actual webhook/sender/profile enrollment, authorized recipient opt-in, approved
   hosted worker/database/app authentication, secret management, document
   isolation/resource limits and cost approval remain prerequisites.
-- Current download policy rejects redirects. If a real Twilio API media URL
-  redirects to its CDN, downloading will fail closed until the actual documented
-  host/path/credential behavior is reviewed; never enable arbitrary redirects.
+- The [official Twilio media-auth guide](https://help.twilio.com/articles/223183748-Prevent-Unauthorized-Access-to-Your-Media-with-HTTP-Basic-Auth)
+  documents a short-lived secured redirect at exactly `mms.twiliocdn.com`; its
+  [Media resource reference](https://www.twilio.com/docs/messaging/api/media-resource)
+  also describes direct content. Both direct responses and **one** authenticated
+  API-to-CDN hop are supported. The CDN client receives no account credentials,
+  cookies or referrer. Additional redirects, other hosts (including legacy public
+  S3), ports, userinfo, fragments, controls and ambiguous encoded paths are denied.
+  Twilio does not publish a stable CDN path/query schema here: these are opaque
+  capability values accepted only from the authenticated account/message-bound
+  API response, never a webhook URL. Before live use, an explicitly approved
+  synthetic attachment probe must confirm this account returns direct content
+  or the supported one-hop shape, MIME and size; never broaden the host allowlist
+  or log a signed URL to work around an unexpected result.
 - No templates are configured. Outside 24 hours, the outbox stops rather than
   issuing a free-form PDF or speculative template. Failed/ambiguous media sends
   need review; this implementation does not assert transport idempotency.

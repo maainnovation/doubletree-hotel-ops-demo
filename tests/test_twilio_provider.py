@@ -310,3 +310,130 @@ def test_publisher_rejection_is_sanitized_and_never_sends():
         item.send_document(MANAGER, PDF, "roster.pdf", "", "outbox:11")
     assert TOKEN not in str(exc.value)
     assert not seen
+
+
+# The path/query are fictional opaque capability material, not a claim about
+# Twilio's undocumented path schema. Only its documented CDN hostname is fixed.
+CDN_URL = "https://mms.twiliocdn.com/synthetic/object.pdf?Expires=123&Signature=opaque%2Btoken&Key-Pair-Id=synthetic"
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_documented_secured_cdn_single_hop_never_receives_auth_cookies_or_referrer(status):
+    seen = []
+    def handler(request):
+        seen.append(request)
+        if len(seen) == 1:
+            assert str(request.url) == URL
+            assert request.headers.get("authorization", "").startswith("Basic ")
+            return httpx.Response(status, headers={"Location": CDN_URL,
+                "Set-Cookie": "api-session=secret; Domain=.twiliocdn.com; Path=/"})
+        assert str(request.url) == CDN_URL
+        assert request.url.query == b"Expires=123&Signature=opaque%2Btoken&Key-Pair-Id=synthetic"
+        for header in ("authorization", "cookie", "proxy-authorization", "referer"):
+            assert header not in request.headers
+        assert request.headers["accept-encoding"] == "identity"
+        return httpx.Response(200, content=PDF, headers={"Content-Type": "application/pdf"})
+    assert provider(handler).fetch_media(URL, "application/pdf", 1024) == PDF
+    assert len(seen) == 2
+
+
+@pytest.mark.parametrize("location", [
+    "https://s3-external-1.amazonaws.com/bucket/object.pdf?token=synthetic",
+    "https://bucket.s3.amazonaws.com/object.pdf?token=synthetic",
+    "https://mms.twiliocdn.com.evil.test/object.pdf?token=synthetic",
+    "https://sub.mms.twiliocdn.com/object.pdf?token=synthetic",
+    "http://mms.twiliocdn.com/object.pdf?token=synthetic",
+    "https://127.0.0.1/object.pdf?token=synthetic",
+    "https://[::1]/object.pdf?token=synthetic",
+    "https://localhost/object.pdf?token=synthetic",
+    "https://mms.twiliocdn.com:443/object.pdf?token=synthetic",
+    "https://user:password@mms.twiliocdn.com/object.pdf?token=synthetic",
+    "https://mms.twiliocdn.com@evil.test/object.pdf?token=synthetic",
+    "https://mms.twiliocdn.com/object.pdf?token=synthetic#fragment",
+    "https://mms.twiliocdn.com//evil.test/object.pdf",
+    "https://mms.twiliocdn.com/../object.pdf",
+    "https://mms.twiliocdn.com/./object.pdf",
+    "https://mms.twiliocdn.com/%2e%2e/object.pdf",
+    "https://mms.twiliocdn.com/%252e%252e/object.pdf",
+    "https://mms.twiliocdn.com/path%2f..%2fobject.pdf",
+    "https://mms.twiliocdn.com/%5cobject.pdf",
+    "https://mms.twiliocdn.com/object.pdf?token=%250a",
+    "https://mms.twiliocdn.com/object.pdf?token=%0a",
+    "https://mms.twiliocdn.com/object.pdf?token=%ff",
+    "https://mms.twiliocdn.com/object.pdf?token=%XX",
+    "https://mms.twiliocdn.com/object.pdf?token=\nsecret",
+    "https://mms.twiliocdn.com/object.pdf?token=secret\x7f",
+    "/relative/object.pdf", "//mms.twiliocdn.com/object.pdf", "",
+    "https://mms.twiliocdn.com/object.pdf?token=" + "x" * 8200,
+])
+def test_unapproved_or_ambiguous_cdn_locations_fail_before_second_request(location):
+    seen = []
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(302, headers={"Location": location})
+    with pytest.raises(ProviderError):
+        provider(handler).fetch_media(URL, "application/pdf", 1024)
+    assert len(seen) == 1
+
+
+def test_cdn_location_is_not_accepted_as_initial_media_url():
+    seen = []
+    with pytest.raises(ProviderError):
+        provider(lambda request: seen.append(request)).fetch_media(CDN_URL, "application/pdf", 1024)
+    assert not seen
+
+
+def test_multiple_location_headers_are_ambiguous():
+    seen = []
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(302, headers=[("Location", CDN_URL), ("Location", CDN_URL)])
+    with pytest.raises(ProviderError):
+        provider(handler).fetch_media(URL, "application/pdf", 1024)
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("second_location", [CDN_URL, "https://api.twilio.com/private", "https://evil.test/file"])
+def test_cdn_redirect_chains_are_never_followed(second_location):
+    seen = []
+    def handler(request):
+        seen.append(request)
+        if len(seen) == 1:
+            return httpx.Response(302, headers={"Location": CDN_URL})
+        assert "authorization" not in request.headers
+        return httpx.Response(302, headers={"Location": second_location})
+    with pytest.raises(ProviderError):
+        provider(handler).fetch_media(URL, "application/pdf", 1024)
+    assert len(seen) == 2
+
+
+@pytest.mark.parametrize("headers,body", [
+    ({"Content-Type": "text/html"}, PDF),
+    ({"Content-Type": "application/pdf"}, b""),
+    ({"Content-Type": "application/pdf"}, b"x" * 2048),
+    ({"Content-Type": "application/pdf", "Content-Length": "999999"}, PDF),
+    ({"Content-Type": "application/pdf", "Content-Encoding": "br"}, PDF),
+])
+def test_cdn_content_has_same_type_and_bounded_size_policy(headers, body):
+    seen = []
+    def handler(request):
+        seen.append(request)
+        if len(seen) == 1:
+            return httpx.Response(302, headers={"Location": CDN_URL})
+        return httpx.Response(200, headers=headers, content=body)
+    with pytest.raises(ProviderError):
+        provider(handler).fetch_media(URL, "application/pdf", 1024)
+    assert len(seen) == 2
+
+
+def test_cdn_transfer_errors_do_not_leak_signed_capability():
+    seen = []
+    def handler(request):
+        seen.append(request)
+        if len(seen) == 1:
+            return httpx.Response(302, headers={"Location": CDN_URL})
+        raise httpx.ReadTimeout("secret capability " + CDN_URL, request=request)
+    with pytest.raises(RetryableProviderError) as exc:
+        provider(handler).fetch_media(URL, "application/pdf", 1024)
+    assert "opaque" not in str(exc.value) and CDN_URL not in str(exc.value)
+    assert len(seen) == 2

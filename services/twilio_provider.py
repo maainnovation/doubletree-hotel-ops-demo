@@ -15,7 +15,7 @@ import json
 import math
 import re
 from typing import Mapping, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import httpx
 from twilio.request_validator import RequestValidator
@@ -104,13 +104,45 @@ def validate_twilio_media_url(url: str, account_sid: str, message_sid: str | Non
     return isinstance(url, str) and re.fullmatch(expected, url) is not None
 
 
+def _twilio_cdn_url(value: str) -> bool:
+    """Only the secured Messaging CDN named by Twilio's media-auth guide.
+
+    The provider does not document a stable CDN path/query schema. Treat both
+    as opaque capability material obtained ONLY from the authenticated,
+    account/message-bound API response. Never accept this URL from a webhook.
+    No old public S3 host, subdomains, ports, escapes that alter routing, or
+    chained redirects are permitted. No URL or signed query is logged.
+    Source: https://help.twilio.com/articles/223183748-Prevent-Unauthorized-Access-to-Your-Media-with-HTTP-Basic-Auth
+    """
+    if (not isinstance(value, str) or len(value) > 8192 or not value.isascii()
+            or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value)
+            or "\\" in value or re.search(r"%(?![0-9a-fA-F]{2})|%25", value, re.IGNORECASE)):
+        return False
+    try:
+        parsed = urlsplit(value)
+        if (parsed.scheme != "https" or parsed.netloc != "mms.twiliocdn.com"
+                or parsed.fragment or not parsed.path.startswith("/")
+                or parsed.path.startswith("//")
+                or re.search(r"%(?:2f|5c)", parsed.path, re.IGNORECASE)):
+            return False
+        decoded_path = unquote(parsed.path, errors="strict")
+        decoded_query = unquote(parsed.query, errors="strict")
+        if (any(segment in {".", ".."} for segment in decoded_path.split("/"))
+                or any(ord(c) < 32 or ord(c) == 127 or c == "\\" for c in decoded_path + decoded_query)):
+            return False
+    except (ValueError, UnicodeError):
+        return False
+    return True
+
+
 class TwilioWhatsAppProvider:
     """No constructor network. Only exact httpx.MockTransport bypasses live gate.
 
     Account-SID/Auth-Token Basic auth is supported for a future approved pilot.
     Production credentials, hosting and entitlement remain separate approvals.
-    Redirecting inbound media is deliberately rejected (never forward auth to a
-    CDN); a live probe may reveal that a reviewed CDN download adapter is needed.
+    Direct media responses and one-hop authenticated API redirects to the exact
+    documented secured Messaging CDN are supported. The CDN request is made in
+    a fresh unauthenticated client; further redirects and public S3 are rejected.
     """
     is_live = True
 
@@ -213,24 +245,40 @@ class TwilioWhatsAppProvider:
         # Never extend a service window into the future due to clock skew.
         return min(timestamp, float(now))
 
+    def _media_body(self, response: httpx.Response, expected_mime: str, max_bytes: int) -> bytes:
+        if response.status_code == 429 or response.status_code >= 500:
+            raise RetryableProviderError("Media download temporarily unavailable.")
+        if not 200 <= response.status_code < 300:
+            raise ProviderError("Media download rejected or redirected.")
+        if response.headers.get("content-type", "").split(";", 1)[0].strip().lower() != expected_mime:
+            raise ProviderError("Downloaded MIME type does not match the webhook.")
+        result = self._read(response, max_bytes)
+        if not result:
+            raise ProviderError("Downloaded media is empty.")
+        return result
+
     def fetch_media(self, media_id: str, expected_mime: str, max_bytes: int) -> bytes:
         _media_limits(expected_mime, max_bytes)
         if not validate_twilio_media_url(media_id, self.account_sid):
             raise ProviderError("Media URL is not a canonical own-account Twilio endpoint.")
         try:
             with self._client() as client, client.stream("GET", media_id) as response:
-                if response.status_code == 429 or response.status_code >= 500:
-                    raise RetryableProviderError("Media download temporarily unavailable.")
-                if not 200 <= response.status_code < 300:
-                    raise ProviderError("Media download rejected or redirected.")
-                if response.headers.get("content-type", "").split(";", 1)[0].strip().lower() != expected_mime:
-                    raise ProviderError("Downloaded MIME type does not match the webhook.")
-                result = self._read(response, max_bytes)
+                if response.status_code not in {301, 302, 303, 307, 308}:
+                    return self._media_body(response, expected_mime, max_bytes)
+                locations = response.headers.get_list("location")
+                if len(locations) != 1 or not _twilio_cdn_url(locations[0]):
+                    raise ProviderError("Media download redirected outside the approved secured CDN.")
+                location = locations[0]
+            # NEVER reuse the authenticated API client, cookie jar, request or
+            # headers. A signed CDN capability needs no account credentials.
+            with httpx.Client(auth=None, timeout=httpx.Timeout(20, connect=5),
+                              trust_env=False, follow_redirects=False,
+                              transport=self._transport,
+                              headers={"Accept-Encoding": "identity"}) as client:
+                with client.stream("GET", location) as response:
+                    return self._media_body(response, expected_mime, max_bytes)
         except httpx.RequestError:
             raise RetryableProviderError("Media transfer interrupted; safe to retry.") from None
-        if not result:
-            raise ProviderError("Downloaded media is empty.")
-        return result
 
     def _send(self, to: str, payload: dict) -> str:
         payload = {"From": f"whatsapp:+{self.sender}", "To": f"whatsapp:+{to}", **payload}

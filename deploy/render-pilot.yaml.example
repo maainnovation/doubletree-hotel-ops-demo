@@ -1,0 +1,59 @@
+# LOCAL REVIEW TEMPLATE ONLY. Not applied; does not authorize paid provisioning.
+# Verify costs, account access and the bounded synthetic pilot approval first.
+# Docs checked 2026-10-25:
+# https://render.com/docs/blueprint-spec
+# https://render.com/docs/disks
+# https://render.com/docs/docker
+# Structure validated against https://render.com/schema/render.yaml.json.
+# This is not account-aware CLI/API validation or a verified image build.
+#
+# One paid instance intentionally shares a single disk between API and worker.
+# A second Render worker service cannot mount this disk. Do not scale instances.
+# Before enabling: confirm /var/data is writable by UID/GID 1000 and is private.
+# Docker-image directory ownership may be hidden by the runtime disk mount. If
+# provisioned ownership differs, an authorized operator must fix the disk mount
+# permissions once; do NOT change the application to run as root or chmod 777.
+# No pre-deploy disk initialization: Render disks exist only at runtime.
+# This template disables automatic deploys/previews and leaves live use disabled.
+previews:
+  generation: "off"
+services:
+  - type: web
+    name: hotel-whatsapp-synthetic-pilot
+    runtime: docker
+    repo: https://github.com/maainnovation/doubletree-hotel-ops-demo
+    branch: feature/whatsapp-forecast-workflow
+    plan: 0.5c-512mb
+    numInstances: 1
+    autoDeployTrigger: "off"
+    dockerfilePath: ./Dockerfile.pilot
+    dockerContext: .
+    healthCheckPath: /health
+    disk:
+      name: synthetic-pilot-private-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PILOT_ENABLED
+        value: "0"
+      - key: PILOT_DATA_ROOT
+        value: /var/data/whatsapp-pilot
+      - key: PILOT_VOLUME_CONFIRMED
+        value: "0"
+      # Supply explicitly approved UTC expiry/origin and exact manager mapping.
+      # sync:false prompts only during initial creation, never stores values here.
+      - key: PILOT_APPROVED_UNTIL
+        sync: false
+      # Current pilot week's Friday in YYYY-MM-DD format, explicitly selected.
+      - key: PILOT_WEEK_START
+        sync: false
+      - key: PILOT_EXTERNAL_ORIGIN
+        sync: false
+      - key: PILOT_MANAGER_PHONE
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_WHATSAPP_FROM
+        sync: false
