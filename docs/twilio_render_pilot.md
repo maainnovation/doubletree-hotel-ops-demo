@@ -146,3 +146,33 @@ network delivery and on-device receipt remain unverified until the approved test
 - A real local supervisor/API/worker process smoke test (disabled, no secrets)
   returned disabled health and shut down both children cleanly. This is not a
   Docker image build, Render deployment or live WhatsApp test.
+
+## Observed legacy Sandbox compatibility: authenticated Media attestation
+
+During the authorized synthetic live test, the signed inbound PDF webhook was
+accepted, but the same-account Message-resource read returned HTTP 404 / Twilio
+20404 and the filtered Message list was empty. The exact signed Media resource's
+JSON metadata returned 200 with the expected account, parent Message SID, media
+SID, PDF MIME type and fresh timezone-aware creation date. No send was attempted.
+
+The isolated pilot now handles **only that typed Message-read 404** by validating
+the authenticated Media metadata against its existing claimed, signed, enrolled
+job. A mismatched Message, stale date, 401, redirect, malformed or truncated
+response never triggers fallback. Media creation must be within 30 minutes,
+not in the future, within five minutes of the immutable first webhook receipt,
+and within the approved pilot interval. The original receipt and attestation
+are audited on the job under its current claim; safe retries retain them.
+
+Media creation is **not asserted to be WhatsApp message-arrival time**. For this
+explicit fresh synthetic experiment only, a conservative window anchor ensures
+outbound permission ends five minutes before the fixed pilot approval deadline,
+not 24 hours after media creation. Normal provider/production Message timestamp
+verification is unchanged. Exact fixture SHA, recipient, identity, expiry and
+three-attempt limits remain unchanged. The Media metadata schema is documented
+in [Twilio's official Media resource reference](https://www.twilio.com/docs/messaging/api/media-resource).
+
+The compatibility fix adds **70 passing tests**. Final full regression on that
+revision: **677 passed, 2 unchanged baseline OCR failures**, 2 warnings (198.24s).
+Independent scoped security review passed, including receipt/anchor atomicity
+and claim-safe retries. A read-only live media preflight confirmed the original
+synthetic fixture's exact 1,677 bytes and SHA; outbound delivery is not implied.

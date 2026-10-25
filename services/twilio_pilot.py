@@ -12,6 +12,7 @@ import fcntl
 import hashlib
 from io import BytesIO
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -26,7 +27,7 @@ from reportlab.lib.pagesizes import landscape, letter
 from services.hotel_parameters import apply_shared_parameters
 from services.staff_settings import demo_defaults
 from services.twilio_media import TwilioMediaPublisher
-from services.twilio_provider import TwilioWhatsAppProvider, twilio_business_id
+from services.twilio_provider import TwilioWhatsAppProvider, twilio_business_id, ProviderResourceNotFound
 from services.whatsapp_provider import ProviderError
 from services.whatsapp_store import PrivateFileStore, WorkflowStore
 
@@ -169,7 +170,63 @@ class SyntheticPilotProvider:
         self.assert_active()
         if sender!=self.config.manager_phone:
             raise ProviderError('Sender is not enrolled for this isolated pilot.')
-        return self.transport_provider.verify_inbound_message(message_sid,sender,now)
+        try:
+            return self.transport_provider.verify_inbound_message(message_sid,sender,now)
+        except ProviderResourceNotFound:
+            # Some trial Sandbox accounts expose Media metadata but return 404
+            # for its parent Message. Never fall back on a mismatched Message,
+            # stale timestamp, 401, redirect, malformed response or network error.
+            return self._attest_fresh_pilot_media(message_sid,sender,now)
+
+    def _attest_fresh_pilot_media(self,message_sid,sender,now):
+        # The signed webhook established sender/business/tenant binding. Only an
+        # existing claimed job can supply the URL; never accept one from callers.
+        with self.store._connect() as db:
+            db.row_factory=sqlite3.Row
+            row=db.execute('SELECT * FROM wa_jobs WHERE phone_number_id=? AND message_id=? AND sender=? AND tenant_id=? AND status=?',
+                           (self.phone_number_id,message_sid,sender,TENANT,'processing')).fetchone()
+        if not row or not row['claim_token']:
+            raise ProviderError('No claimed signed pilot input exists for media attestation.')
+        try:
+            media=json.loads(row['media_json'])
+            enrolled=self.store.enrollment(self.phone_number_id,sender)
+            if (not enrolled or media.get('_provider')!='twilio' or media.get('type')!='document'
+                    or media.get('mime')!='application/pdf'
+                    or media.get('_enrollment_binding')!=self.store.enrollment_binding(enrolled)):
+                raise ValueError
+            timestamp=self.transport_provider.verify_inbound_media_metadata(media['id'],message_sid,now)
+            prior=media.get('_pilot_attestation')
+            receipt=row['inbound_at']
+            if prior is not None:
+                if (not isinstance(prior,dict) or prior.get('kind')!='authenticated_media_after_message_404'
+                        or prior.get('window_anchor')!=row['inbound_at'] or prior.get('media_created_at')!=timestamp):
+                    raise ValueError
+                receipt=prior.get('first_received_at')
+            if isinstance(receipt,bool) or not isinstance(receipt,(int,float)) or not math.isfinite(receipt):
+                raise ValueError
+            # This is ONLY a fresh, observed synthetic pilot upload. The Media
+            # creation time is not claimed to be the WhatsApp arrival time.
+            # Bound it to the signed first receipt and the explicit pilot epoch.
+            floor=self.config.approved_until-86400
+            if timestamp<floor or not 0<=now-timestamp<=1800 or abs(timestamp-receipt)>300:
+                raise ValueError
+            # Conservative pilot window ends five minutes BEFORE approval expiry,
+            # never media_created+24h. Generic production verification is unchanged.
+            anchor=min(timestamp,receipt,float(now),floor)-300
+            if now-anchor>=86400:
+                raise ValueError
+        except (KeyError,TypeError,ValueError):
+            raise ProviderError('Fresh signed pilot media attestation failed.') from None
+        media['_pilot_attestation']={'kind':'authenticated_media_after_message_404',
+                                     'media_created_at':timestamp,'first_received_at':receipt,'window_anchor':anchor}
+        with self.store._connect() as db:
+            # Keep receipt audit and conservative anchor crash-consistent; the
+            # worker may safely write the same anchor again after this returns.
+            updated=db.execute('UPDATE wa_jobs SET media_json=?,inbound_at=? WHERE id=? AND status=? AND claim_token=? AND media_json=?',
+                               (json.dumps(media),anchor,row['id'],'processing',row['claim_token'],row['media_json'])).rowcount
+            if updated!=1:
+                raise ProviderError('Pilot claim changed during media attestation.')
+        return anchor
 
     def fetch_media(self,media_id,expected_mime,max_bytes):
         self.assert_active()

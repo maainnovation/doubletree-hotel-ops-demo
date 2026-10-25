@@ -30,6 +30,10 @@ _MESSAGE = re.compile(r"(?:SM|MM)[0-9a-fA-F]{32}")
 _JSON_LIMIT = 64 * 1024
 
 
+class ProviderResourceNotFound(ProviderError):
+    """Authenticated read returned 404; not an identity/time validation failure."""
+
+
 class MediaPublisher(Protocol):
     """Issue a bounded-lifetime URL for this outbox PDF, never a public listing."""
     def publish(self, pdf_bytes: bytes, filename: str, idempotency_key: str) -> str: ...
@@ -200,6 +204,8 @@ class TwilioWhatsAppProvider:
                     raise AmbiguousSendError("Twilio send outcome is unknown; reconciliation required.")
                 if response.status_code == 429 or (not sending and response.status_code >= 500):
                     raise RetryableProviderError("Provider temporarily unavailable before a confirmed send.")
+                if not sending and response.status_code == 404:
+                    raise ProviderResourceNotFound("Provider resource was not found.")
                 if not 200 <= response.status_code < 300:
                     raise ProviderError("Provider rejected or redirected the request.")
                 try:
@@ -244,6 +250,36 @@ class TwilioWhatsAppProvider:
             raise ProviderError("Inbound provider timestamp is invalid, stale, or too far in the future.") from None
         # Never extend a service window into the future due to clock skew.
         return min(timestamp, float(now))
+
+    def verify_inbound_media_metadata(self, media_url: str, message_sid: str, now: float) -> float:
+        """Attest a signed envelope's Media resource, not its sender or arrival time.
+
+        Only the isolated pilot may use this after a Message-resource 404. This
+        does not replace normal Message identity/window verification. Media
+        creation time alone is NOT a general WhatsApp service-window origin.
+        """
+        if (not validate_twilio_media_url(media_url, self.account_sid, message_sid)
+                or isinstance(now, bool) or not isinstance(now, (float, int)) or not math.isfinite(now)):
+            raise ProviderError("Invalid inbound media identity or reference time.")
+        metadata = self._json_request("GET", media_url + ".json")
+        if (metadata.get("account_sid") != self.account_sid
+                or metadata.get("parent_sid") != message_sid
+                or metadata.get("sid") != media_url.rsplit("/", 1)[1]
+                or metadata.get("content_type") != "application/pdf"):
+            raise ProviderError("Inbound media metadata does not match the signed PDF envelope.")
+        try:
+            value = metadata["date_created"]
+            if not isinstance(value, str):
+                raise ValueError
+            created = parsedate_to_datetime(value)
+            if created.tzinfo is None:
+                raise ValueError
+            timestamp = created.astimezone(timezone.utc).timestamp()
+            if not math.isfinite(timestamp) or timestamp > now or now - timestamp >= 24 * 3600:
+                raise ValueError
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise ProviderError("Inbound media timestamp is invalid, stale, or in the future.") from None
+        return timestamp
 
     def _media_body(self, response: httpx.Response, expected_mime: str, max_bytes: int) -> bytes:
         if response.status_code == 429 or response.status_code >= 500:
