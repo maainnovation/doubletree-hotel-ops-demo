@@ -32,6 +32,79 @@ def sample_forecast(start=date(2026, 9, 25)):
     return rows
 
 
+def test_parameter_change_requires_regenerate_and_summary_is_collapsed(tmp_path, monkeypatch):
+    monkeypatch.setenv("COPILOT_STATE_DB", str(tmp_path / "dynamic-ui.sqlite3"))
+    monkeypatch.setenv("WEB_MANAGER_ID", "dynamic-ui")
+    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py").run(timeout=40)
+    app.session_state["forecast_confirmed"] = normalize_forecast_rows(sample_forecast())
+    app.run(timeout=40)
+    next(button for button in app.button if button.label == "Regenerate weekly roster").click().run(timeout=40)
+    original = deepcopy(app.session_state["weekly_candidate"])
+    expander = next(item for item in app.expander if item.label == "Day-by-day calculation summary")
+    assert expander.proto.expanded is False
+    assert len([item for item in expander.markdown if "housekeepers needed" in item.value]) == 7
+    # An unsaved manual lock must survive changing parameters and regeneration.
+    app.session_state["weekly_candidate"]["schedule"][0]["locked"] = True
+    app.session_state["weekly_candidate"]["schedule"][0]["notes"] = "Keep this manager edit"
+    app.segmented_control[0].set_value("PARAMETERS").run(timeout=40)
+    next(item for item in app.number_input if item.key == "param_checkout_minutes").set_value(25).run(timeout=40)
+    assert app.session_state["staff_saved"]["settings"]["cleaning_standards"]["checkout_minutes"] == 25
+    app.segmented_control[0].set_value("WEEKLY FORECAST").run(timeout=40)
+    assert any("ROSTER OUT OF DATE" in item.value for item in app.warning)
+    assert app.session_state["weekly_candidate"]["demand_minutes"] == original["demand_minutes"]
+    assert not any(button.label == "Save reviewed roster version" for button in app.button)
+    assert not app.get("download_button")
+    assert not any(item.label == "Day-by-day calculation summary" for item in app.expander)
+    next(button for button in app.button if button.label == "Regenerate weekly roster").click().run(timeout=40)
+    updated = deepcopy(app.session_state["weekly_candidate"])
+    assert updated["forecast"] == original["forecast"]
+    assert updated["demand_minutes"]["2026-09-25"] == original["demand_minutes"]["2026-09-25"] + 110 * 3
+    assert updated["schedule"][0]["locked"] is True
+    assert "Keep this manager edit" in updated["schedule"][0]["notes"]
+    assert not any("ROSTER OUT OF DATE" in item.value for item in app.warning)
+    # The Staff & Settings edit path shares the same cleaning values.
+    app.segmented_control[0].set_value("STAFF & SETTINGS").run(timeout=40)
+    next(item for item in app.number_input if item.label == "Checkout cleaning standard (minutes)").set_value(22)
+    next(button for button in app.button if button.label == "Save changes").click().run(timeout=40)
+    assert app.session_state["parameters"]["checkout_minutes"] == 22
+    app.segmented_control[0].set_value("WEEKLY FORECAST").run(timeout=40)
+    assert any("ROSTER OUT OF DATE" in item.value for item in app.warning)
+    next(button for button in app.button if button.label == "Regenerate weekly roster").click().run(timeout=40)
+    assert app.session_state["weekly_candidate"]["demand_minutes"] == original["demand_minutes"]
+    assert not app.exception
+
+
+def test_increasing_workload_does_not_always_change_needed_headcount():
+    from services.weekly_roster import roster_calculation_summary
+    rows, payload = sample_forecast(), demo_defaults()
+    before = roster_calculation_summary(generate_weekly_roster(rows, payload))
+    payload["settings"]["cleaning_standards"]["checkout_minutes"] = 25
+    after = roster_calculation_summary(generate_weekly_roster(rows, payload))
+    assert all(b["demand_minutes"] > a["demand_minutes"] for a, b in zip(before, after))
+    assert any(b["required_housekeepers"] == a["required_housekeepers"] for a, b in zip(before, after))
+
+
+def test_cancelled_staff_settings_do_not_change_weekly_inputs(tmp_path, monkeypatch):
+    from services.weekly_roster import is_roster_current
+    monkeypatch.setenv("COPILOT_STATE_DB", str(tmp_path / "cancel-settings.sqlite3"))
+    monkeypatch.setenv("WEB_MANAGER_ID", "cancel-settings")
+    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py").run(timeout=40)
+    forecast = normalize_forecast_rows(sample_forecast())
+    app.session_state["forecast_confirmed"] = forecast
+    app.session_state["weekly_candidate"] = generate_weekly_roster(forecast, app.session_state["staff_saved"])
+    original = deepcopy(app.session_state["weekly_candidate"])
+    app.segmented_control[0].set_value("STAFF & SETTINGS").run(timeout=40)
+    next(item for item in app.number_input if item.label == "Checkout cleaning standard (minutes)").set_value(25)
+    next(button for button in app.button if button.label == "Cancel edits").click().run(timeout=40)
+    assert app.session_state["parameters"]["checkout_minutes"] == 22
+    assert app.session_state["staff_saved"]["settings"]["cleaning_standards"]["checkout_minutes"] == 22
+    app.segmented_control[0].set_value("WEEKLY FORECAST").run(timeout=40)
+    assert app.session_state["weekly_candidate"] == original
+    assert is_roster_current(original, forecast, app.session_state["staff_saved"])
+    assert not any("ROSTER OUT OF DATE" in item.value for item in app.warning)
+    assert not app.exception
+
+
 def open_forecast_data_view(app):
     app.radio[0].set_value("Extracted forecast data").run(timeout=40)
 
@@ -290,7 +363,7 @@ def test_ui_generate_and_save_weekly_roster_persists_confirmed_forecast(tmp_path
     app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py").run(timeout=40)
     app.session_state["forecast_confirmed"] = normalize_forecast_rows(sample_forecast())
     app.segmented_control[0].set_value("WEEKLY FORECAST").run(timeout=40)
-    next(button for button in app.button if button.label == "Generate / update weekly roster").click().run(timeout=40)
+    next(button for button in app.button if button.label == "Regenerate weekly roster").click().run(timeout=40)
     assert not app.exception
     assert app.session_state["weekly_candidate"]["feasible"] is True
     next(item for item in app.checkbox if "reviewed the displayed changes" in item.label).check().run(timeout=40)
@@ -311,7 +384,7 @@ def test_ui_roster_manual_edit_is_locked_when_rebuilding_preview(tmp_path, monke
     app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py").run(timeout=40)
     app.session_state["forecast_confirmed"] = normalize_forecast_rows(sample_forecast())
     app.segmented_control[0].set_value("WEEKLY FORECAST").run(timeout=40)
-    next(button for button in app.button if button.label == "Generate / update weekly roster").click().run(timeout=40)
+    next(button for button in app.button if button.label == "Regenerate weekly roster").click().run(timeout=40)
     before = app.session_state["weekly_candidate"]
     target = next(row for row in before["schedule"] if row["date"] == "2026-09-26" and row["role"] == "Housekeeper" and row["code"] == "SHIFT")
     row_index = before["schedule"].index(target)
@@ -358,19 +431,29 @@ def test_ui_invalid_blank_manual_forecast_is_rejected_before_confirmation(tmp_pa
     assert not app.exception
 
 
-def test_existing_today_housekeeping_and_liquor_views_still_render(tmp_path, monkeypatch):
+def test_hidden_navigation_and_preserved_views(tmp_path, monkeypatch):
     monkeypatch.setenv("COPILOT_STATE_DB", str(tmp_path / "existing-views.sqlite3"))
     monkeypatch.setenv("WEB_MANAGER_ID", "existing-views-smoke")
-    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py").run(timeout=40)
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    app = AppTest.from_file(app_path).run(timeout=40)
     assert app.segmented_control[0].value == "WEEKLY FORECAST"
-    assert any("Weekly Forecast" in item.value for item in app.subheader)
-    app.segmented_control[0].set_value("TODAY").run(timeout=40)
-    assert any("Today's overview" in item.value for item in app.subheader)
-    app.segmented_control[0].set_value("OPERATIONS").run(timeout=40)
-    assert any("Operations" in item.value for item in app.subheader)
-    assert any("Housekeeping" in item.label for item in app.tabs)
-    assert any("Bar & inventory" in item.label for item in app.tabs)
+    assert len(app.segmented_control[0].options) == 4
+    assert not any("Today" in item or "Operations" in item for item in app.segmented_control[0].options)
+    # Sessions left on a now-hidden page return to Weekly Forecast safely.
+    app.session_state["navigation"] = "TODAY"
+    app.run(timeout=40)
+    assert app.segmented_control[0].value == "WEEKLY FORECAST"
     assert not app.exception
+    # Removing the temporary hide list restores both original renderers.
+    monkeypatch.setenv("HOTEL_OPS_WORKBOOK", str(app_path.parent / "data/Hotel_Ops_Demo_Data.xlsx"))
+    source = app_path.read_text().replace('HIDDEN_NAVIGATION = {"TODAY", "OPERATIONS"}', 'HIDDEN_NAVIGATION = set()')
+    restored = AppTest.from_string(source).run(timeout=40)
+    restored.segmented_control[0].set_value("TODAY").run(timeout=40)
+    assert any("Today's overview" in item.value for item in restored.subheader)
+    restored.segmented_control[0].set_value("OPERATIONS").run(timeout=40)
+    assert any("Housekeeping" in item.label for item in restored.tabs)
+    assert any("Bar & inventory" in item.label for item in restored.tabs)
+    assert not restored.exception
 
 
 def test_uploaded_forecast_requires_and_passes_explicit_review_before_generation(tmp_path, monkeypatch):
@@ -396,7 +479,7 @@ def test_uploaded_forecast_requires_and_passes_explicit_review_before_generation
     assert app.session_state["forecast_confirmed"][0]["occupancy_pct"] == 100
     assert any("Confirmed forecast" in item.value for item in app.success)
     app.radio[0].set_value("Weekly roster").run(timeout=40)
-    next(button for button in app.button if button.label == "Generate / update weekly roster").click().run(timeout=40)
+    next(button for button in app.button if button.label == "Regenerate weekly roster").click().run(timeout=40)
     assert app.session_state["weekly_candidate"]["feasible"] is True
     assert len(app.session_state["weekly_candidate"]["schedule"]) == 168
     assert not app.exception

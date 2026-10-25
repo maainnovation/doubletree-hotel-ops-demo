@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date, datetime, timedelta
+import hashlib
 import json
 import math
 import re
@@ -33,6 +34,67 @@ def _time_off(person: dict[str, Any]) -> set[str]:
 def _productive_hours(paid_hours: float, settings: dict[str, Any]) -> float:
     cfg = settings["paid_productive_hours"]
     return max(0.0, paid_hours - float(cfg["break_minutes"]) / 60 - float(cfg["other_duties_minutes"]) / 60)
+
+
+def _roster_inputs(forecast_rows: list[dict[str, Any]], staff_payload: dict[str, Any]) -> dict[str, Any]:
+    """Capture calculation inputs, excluding persistence and dataset-mode metadata."""
+    return {"forecast": normalize_forecast_rows(forecast_rows),
+            "staff": deepcopy(staff_payload["staff"]), "settings": deepcopy(staff_payload["settings"])}
+
+
+def _input_signature(inputs: dict[str, Any]) -> str:
+    canonical = json.dumps(inputs, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def is_roster_current(roster: dict[str, Any] | None, forecast_rows: list[dict[str, Any]], staff_payload: dict[str, Any]) -> bool:
+    """Older saved rosters and changed inputs require explicit regeneration."""
+    if not roster or not roster.get("input_signature") or not roster.get("input_snapshot"):
+        return False
+    try:
+        return roster["input_signature"] == _input_signature(_roster_inputs(forecast_rows, staff_payload))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+
+
+def roster_calculation_summary(roster: dict[str, Any]) -> list[dict[str, Any]]:
+    """Explain all seven days using this roster's inputs, not newer edited settings.
+
+    Demand headcount is a rounded-up standard-shift estimate, not a promise that
+    eligible employees can be assigned. Scheduled cleaning coverage and conflicts
+    are reported separately; inspection/other-duty rows do not clean rooms.
+    """
+    inputs = roster.get("input_snapshot")
+    if not inputs:
+        return []
+    settings = inputs["settings"]
+    clean = settings["cleaning_standards"]
+    productive = _productive_hours(float(settings["paid_productive_hours"]["paid_shift_hours"]), settings) * 60
+    minimum = int(settings["minimum_role_coverage"].get("Housekeeper", 0))
+    staff_by_id = {str(person["staff_id"]): person for person in inputs["staff"]}
+    summary = []
+    for forecast in inputs["forecast"]:
+        dkey = forecast["date"]
+        demand = forecast["departures"] * float(clean["checkout_minutes"]) + forecast["stayovers"] * float(clean["stayover_minutes"])
+        cleaning_rows = [row for row in roster["schedule"] if row["date"] == dkey
+                         and staff_by_id.get(str(row["staff_id"]), {}).get("role") == "Housekeeper"
+                         and row.get("code") == "SHIFT" and float(row.get("productive_hours", 0)) > 0]
+        scheduled = sum(float(row["productive_hours"]) * 60 for row in cleaning_rows)
+        uncovered = max(0.0, demand - scheduled)
+        constraints = [item for item in roster.get("constraints", [])
+                       if item.startswith(dkey) or not re.match(r"\d{4}-\d{2}-\d{2}\b", item)]
+        demand_housekeepers = math.ceil(demand / productive)
+        summary.append({"date": dkey, "weekday": date.fromisoformat(dkey).strftime("%a"),
+                        "checkout_rooms": forecast["departures"], "checkout_minutes": float(clean["checkout_minutes"]),
+                        "stayover_rooms": forecast["stayovers"], "stayover_minutes": float(clean["stayover_minutes"]),
+                        "demand_minutes": round(demand, 2), "productive_minutes_per_shift": round(productive, 2),
+                        "demand_housekeepers": demand_housekeepers, "minimum_housekeepers": minimum,
+                        "required_housekeepers": max(demand_housekeepers, minimum),
+                        "scheduled_housekeepers": len({row["staff_id"] for row in cleaning_rows}),
+                        "scheduled_productive_minutes": round(scheduled, 2), "uncovered_minutes": round(uncovered, 2),
+                        "constraints": constraints,
+                        "status": "Uncovered demand" if uncovered > 0.001 else "Review constraints" if constraints else "Covered"})
+    return summary
 
 
 def generate_weekly_roster(forecast_rows: list[dict[str, Any]], staff_payload: dict[str, Any], prior: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -223,7 +285,9 @@ def generate_weekly_roster(forecast_rows: list[dict[str, Any]], staff_payload: d
 
     constraints = list(dict.fromkeys(constraints))
     infeasible = any("minimum coverage" in x or "uncovered" in x or "exceed" in x or "conflicts" in x or "no longer" in x or "no explicit" in x for x in constraints)
+    inputs = _roster_inputs(forecast, staff_payload)
     return {"week_start": forecast[0]["date"], "week_end": forecast[-1]["date"], "forecast": forecast,
+            "input_signature": _input_signature(inputs), "input_snapshot": inputs,
             "schedule": schedule, "constraints": constraints, "feasible": not infeasible,
             "demand_minutes": {row["date"]: int(row["departures"] * float(clean["checkout_minutes"]) + row["stayovers"] * float(clean["stayover_minutes"])) for row in forecast},
             "hours_by_staff": {sid: round(hours, 2) for sid, hours in paid_total.items()}, "version": int((prior or {}).get("version", 0)) + 1}

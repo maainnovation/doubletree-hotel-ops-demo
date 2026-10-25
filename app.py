@@ -28,7 +28,8 @@ from services.forecast_import import (FORECAST_FIELDS, NUMERIC_FIELDS, REVIEW_FI
                                       forecast_rows_to_review_matrix, review_matrix_to_forecast_rows,
                                       normalize_forecast_rows, validate_forecast,
                                       extraction_requires_review_before_generation)
-from services.weekly_roster import generate_weekly_roster, schedule_changes, build_exports, weekly_grid
+from services.weekly_roster import (generate_weekly_roster, schedule_changes, build_exports, weekly_grid,
+                                   is_roster_current, roster_calculation_summary)
 from services.forecast_ai import (ai_vision_available, compare_forecast_extractions,
                                   comparison_to_review_matrix, extract_forecast_with_ai,
                                   fill_missing_from_ai, is_loopback_address)
@@ -107,6 +108,16 @@ def apply_parameter_values(values):
         st.session_state.scenarios["budget_usd"] = None
     st.session_state.parameters = values
     if previous != values:
+        # Share cleaning standards with the weekly planner; never alter room counts.
+        cleaning = {key: values[key] for key in ("checkout_minutes", "stayover_minutes")}
+        saved_cleaning = st.session_state.staff_saved["settings"]["cleaning_standards"]
+        if any(saved_cleaning[key] != value for key, value in cleaning.items()):
+            saved_cleaning.update(cleaning)
+            st.session_state.staff_draft["settings"]["cleaning_standards"].update(cleaning)
+            st.session_state.staff_editor_version = st.session_state.get("staff_editor_version", 0) + 1
+            mode = st.session_state.staff_saved.get("dataset_mode", "operational")
+            state_store.save_staff_settings(WEB_MANAGER_ID, st.session_state.staff_saved,
+                                           DEMO_SEED_VERSION if mode == "demo" else 0, dataset_mode=mode)
         invalidate(st.session_state.approval, "Operating parameters changed")
         record_web_change("operating_parameters", previous, values, "Manager updated calculation parameters")
         persist_web_state(st.session_state.pending)
@@ -192,6 +203,8 @@ def load_state():
 data, validation, load_error = load_state()
 if data and "parameters" not in st.session_state:
     st.session_state.parameters = workbook_parameters(data.settings)
+    st.session_state.parameters.update({key: st.session_state.staff_saved["settings"]["cleaning_standards"][key]
+                                        for key in ("checkout_minutes", "stayover_minutes")})
 with st.container(horizontal=True, horizontal_alignment="distribute", vertical_alignment="center"):
     st.markdown(":material/concierge: **HOTEL OPERATIONS**")
     with st.popover("Workspace", icon=":material/tune:"):
@@ -206,7 +219,7 @@ with st.container(horizontal=True, horizontal_alignment="distribute", vertical_a
             st.session_state.chat_undo = None
             st.session_state.approval = {"status": "AWAITING APPROVAL", "history": []}
             if data:
-                st.session_state.parameters = workbook_parameters(data.settings)
+                apply_parameter_values(workbook_parameters(data.settings))
                 for name, value in st.session_state.parameters.items():
                     st.session_state[f"param_{name}"] = value
             persist_web_state()
@@ -227,7 +240,14 @@ if load_error or (validation and not validation.is_valid):
     st.info("Add or fix the workbook, then select Sync Hotel Data.")
     st.stop()
 
-nav = st.segmented_control("Navigation", ["WEEKLY FORECAST", "TODAY", "PARAMETERS", "STAFF & SETTINGS", "AI Chat - My Copilot", "OPERATIONS"],
+# Temporarily hidden for the focused forecast demo; remove names here to restore.
+# Their renderers and underlying operations remain intact below.
+HIDDEN_NAVIGATION = {"TODAY", "OPERATIONS"}
+navigation_options = [page for page in ["WEEKLY FORECAST", "TODAY", "PARAMETERS", "STAFF & SETTINGS", "AI Chat - My Copilot", "OPERATIONS"]
+                      if page not in HIDDEN_NAVIGATION]
+if st.session_state.get("navigation") not in navigation_options:
+    st.session_state.navigation = "WEEKLY FORECAST"
+nav = st.segmented_control("Navigation", navigation_options,
     format_func=lambda label: {"WEEKLY FORECAST": ":material/calendar_month: Weekly Forecast", "TODAY": ":material/dashboard: Today", "PARAMETERS": ":material/tune: Parameters", "STAFF & SETTINGS": ":material/groups: Staff & Settings", "OPERATIONS": ":material/room_service: Operations"}.get(label, label),
     default="WEEKLY FORECAST", label_visibility="collapsed", key="navigation", width="stretch")
 
@@ -238,7 +258,7 @@ for name, value in st.session_state.parameters.items():
 
 if nav == "PARAMETERS":
     st.subheader("Shape your operating plan")
-    st.caption("Change a driver and the calculated results below update immediately. These values apply to Today, Operations, and AI Chat for this session.")
+    st.caption("Daily calculations update immediately. Checkout and stayover cleaning times also update the weekly planner: return to Weekly Forecast and select Regenerate weekly roster. Forecast room counts do not change. Other daily and inventory inputs remain separate from weekly Staff & Settings assumptions.")
     hk_tab, inventory_tab = st.tabs(["Housekeeping & staffing", "Inventory & purchasing"])
     with hk_tab:
         a, b = st.columns(2)
@@ -383,7 +403,7 @@ elif nav == "STAFF & SETTINGS":
     st.subheader("Staff & Settings")
     st.warning("PUBLIC DEMO ONLY · This app has no sign-in. Entries may be stored in the app's SQLite database and can be lost or shared depending on deployment configuration. Use fictional sample data only; never enter real employee identities, availability, time off, or hotel policy.")
     st.warning("DEMO ASSUMPTIONS · Fictional staff and editable examples. These values are not hotel policy.")
-    st.caption("Changes are saved to this app's SQLite state, separately from the hotel operations workbook. Display names are labels; stable staff IDs identify each employee. This is a maintenance page; the current calculator still reads workbook staff and settings.")
+    st.caption("Saved staff and assumptions drive the weekly roster. Checkout and stayover cleaning times are shared with Parameters and AI Chat. After changes, select Regenerate weekly roster; the forecast room counts stay unchanged. Daily staffing still uses the separate workbook roster.")
     current_mode = st.session_state.staff_saved.get("dataset_mode", "operational")
     if current_mode == "demo":
         st.info("Dataset state: **DEMO**. The reset action can replace this entire roster and its assumptions.")
@@ -452,6 +472,10 @@ elif nav == "STAFF & SETTINGS":
                 state_store.save_staff_settings(WEB_MANAGER_ID, cleaned, DEMO_SEED_VERSION if cleaned["dataset_mode"] == "demo" else 0, dataset_mode=cleaned["dataset_mode"])
                 st.session_state.staff_saved = cleaned
                 st.session_state.staff_draft = clean_payload(cleaned)
+                cleaning = cleaned["settings"]["cleaning_standards"]
+                apply_parameter_values({**st.session_state.parameters, **{key: cleaning[key] for key in ("checkout_minutes", "stayover_minutes")}})
+                for key in ("checkout_minutes", "stayover_minutes"):
+                    st.session_state[f"param_{key}"] = cleaning[key]
                 st.session_state.staff_editor_version += 1
                 st.success("Staff and settings saved to persistent app storage.")
                 st.rerun()
@@ -473,6 +497,10 @@ elif nav == "STAFF & SETTINGS":
             state_store.save_staff_settings(WEB_MANAGER_ID, defaults, DEMO_SEED_VERSION, dataset_mode="demo")
             st.session_state.staff_saved = defaults
             st.session_state.staff_draft = clean_payload(defaults)
+            cleaning = defaults["settings"]["cleaning_standards"]
+            apply_parameter_values({**st.session_state.parameters, **{key: cleaning[key] for key in ("checkout_minutes", "stayover_minutes")}})
+            for key in ("checkout_minutes", "stayover_minutes"):
+                st.session_state[f"param_{key}"] = cleaning[key]
             st.session_state.staff_editor_version += 1
             st.success("The demo roster and assumptions were reset.")
             st.rerun()
@@ -657,9 +685,9 @@ elif nav == "WEEKLY FORECAST":
                 st.caption(f"Saved roster version {saved_lookup['version']} · updated {saved_lookup.get('updated_at', 'unknown time')}")
                 if st.button("Load this saved forecast and roster", key="load_saved_week"):
                     st.session_state.forecast_confirmed = saved_lookup["forecast"]
-                    st.session_state.weekly_candidate = None
+                    st.session_state.weekly_candidate = saved_lookup
                     st.session_state.weekly_candidate_is_draft = False
-                    st.session_state.weekly_loaded = saved_lookup
+                    st.session_state.weekly_candidate_version = st.session_state.get("weekly_candidate_version", 0) + 1
                     st.rerun()
         confirmed = st.session_state.forecast_confirmed
         roster_forecast = confirmed
@@ -707,17 +735,38 @@ elif nav == "WEEKLY FORECAST":
                 st.error("Staff & Settings needs correction before generation:")
                 for error in roster_errors: st.write(f"• {error}")
             else:
-                if st.button("Generate / update weekly roster", type="primary", key="generate_weekly_roster"):
+                if st.button("Regenerate weekly roster", type="primary", key="generate_weekly_roster"):
                     try:
-                        st.session_state.weekly_candidate = generate_weekly_roster(confirmed, st.session_state.staff_saved, prior=existing)
+                        prior = st.session_state.weekly_candidate
+                        if not prior or prior.get("week_start") != confirmed[0]["date"]:
+                            prior = existing
+                        st.session_state.weekly_candidate = generate_weekly_roster(confirmed, st.session_state.staff_saved, prior=prior)
                         st.session_state.weekly_candidate_is_draft = not bool(st.session_state.forecast_confirmed)
                         st.session_state.weekly_candidate_version = st.session_state.get("weekly_candidate_version", 0) + 1
                         st.rerun()
                     except ValueError as exc:
                         st.error(str(exc))
             candidate = st.session_state.weekly_candidate
-            if candidate:
+            candidate_current = is_roster_current(candidate, confirmed, st.session_state.staff_saved)
+            if candidate and not candidate_current:
+                st.warning("ROSTER OUT OF DATE · Forecast, staff, or assumptions changed. Select Regenerate weekly roster to recalculate workload and staffing. Previous locked edits are retained; saving and exports are unavailable until regeneration.")
+            if candidate and candidate_current:
                 st.markdown("#### Review generated roster before saving")
+                with st.expander("Day-by-day calculation summary", expanded=False):
+                    st.caption("All seven days · departures are checkout cleans; arrivals are not added again. Housekeepers needed is a rounded-up standard-shift estimate, subject to minimum coverage. Actual shifts depend on availability, hour limits, and locked edits. Cleaning-time changes do not change forecast room counts.")
+                    for day in roster_calculation_summary(candidate):
+                        minimum_note = f" (minimum coverage: {day['minimum_housekeepers']})" if day['minimum_housekeepers'] > day['demand_housekeepers'] else ""
+                        st.markdown(
+                            f"**{day['weekday']} · {day['date']}**  \n"
+                            f"{day['checkout_rooms']:g} checkouts × {day['checkout_minutes']:g} min + "
+                            f"{day['stayover_rooms']:g} stayovers × {day['stayover_minutes']:g} min "
+                            f"= **{day['demand_minutes']:,.0f} cleaning min**. "
+                            f"÷ {day['productive_minutes_per_shift']:g} productive min/shift, rounded up "
+                            f"→ **{day['required_housekeepers']} housekeepers needed**{minimum_note}.  \n"
+                            f"**Scheduled: {day['scheduled_housekeepers']}** for cleaning "
+                            f"({day['scheduled_productive_minutes']:,.0f} min); "
+                            f"uncovered: {day['uncovered_minutes']:,.0f} min. {day['status']}"
+                        )
                 if candidate["feasible"]:
                     st.success("No uncovered demand or hard constraint conflict was detected under the current editable assumptions. This is a shift roster, not a room-level plan.")
                 else:
