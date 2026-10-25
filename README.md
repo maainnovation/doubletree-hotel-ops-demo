@@ -2,19 +2,37 @@
 
 Mobile-first Streamlit demo with editable operating parameters, a separate AI chat workspace, and a FastAPI adapter for optional integrations. The web app and API share the same Python decision engines. Real credentials are not included in the project template.
 
+## WhatsApp-first forecast implementation (development only)
+
+A new signed webhook → durable job → strict forecast validation → versioned roster
+→ PDF outbox workflow is implemented with **fake transport by default**. Run the
+[synthetic end-to-end demo and review production gates](docs/whatsapp_forecast_workflow.md).
+It is not connected to a live number. Native PDFs require an explicitly enrolled
+profile; the supported existing daily-table layout accepts its known labels and
+unambiguous full M/D/YYYY dates. Photos/scans still request correction. Parameters
+now has a shared saved **Total rooms** field (292 for this built-in demo, per the
+user's latest instruction), used with the same saved cleaning standards by the
+WhatsApp worker; no separate enrollment capacity is maintained. The
+legacy WhatsApp text scenario webhook described below has been replaced; the
+manual app and web chat remain available. Do not follow the older live-enable
+steps below for this workflow; credentials alone cannot activate it.
+
 ## Architecture
 
 ```text
-Streamlit web app ──┐
-                    ├── shared Python operations service ── Excel demo workbook
-WhatsApp webhook ─ FastAPI                         └────── SQLite session state
-                         └── optional OpenAI Responses API
-                         └── optional Meta WhatsApp Cloud API
+Streamlit manual app ── shared Python operations / roster service
+WhatsApp signed webhook ── durable jobs ── separate worker ── versioned roster + PDF outbox
+                                                └── fake provider (default)
+                                                └── gated Meta transport (not live)
 ```
 
-The LLM classifies natural-language requests and optionally rewrites a response based on calculated facts. Python calculates the results. The WhatsApp adapter applies scenarios after confirmation; the web chat applies explicit parameter edits immediately and previews hypothetical requests. If `OPENAI_API_KEY` is blank, the deterministic intent parser is used. The WhatsApp webhook verifies Meta's HMAC signature and only processes senders listed in `WHATSAPP_ALLOWED_NUMBERS`.
-
-For the single-manager demo, the Streamlit app and WhatsApp can share the same SQLite scenario/approval state. Set `WEB_MANAGER_ID=demo-gm`, then map the test number with `WHATSAPP_MANAGER_MAP=12125550123=demo-gm`. For multiple managers, map each number to a distinct manager ID. The unauthenticated local Streamlit demo is not an identity system; add real web sign-in before internet deployment.
+The manual web chat optionally uses an LLM to classify requests and compose
+responses; Python calculates the results. WhatsApp forecast processing does not
+use an LLM. Exact operator enrollment binds each sender and business number to
+a hotel/settings record. Legacy phone allowlist/manager-map environment variables
+do not enroll forecast senders. Local development can share the configured
+`COPILOT_STATE_DB` and enrolled `WEB_MANAGER_ID`; the unauthenticated public app
+blocks access to enrolled manager records and is not a production identity system.
 
 ## Publish a public demo on Streamlit Community Cloud
 
@@ -60,18 +78,15 @@ Check `http://127.0.0.1:8000/health` and `http://127.0.0.1:8000/docs`. The `/api
 
 Create an API key in the OpenAI platform and set it as `OPENAI_API_KEY` in `.env`. Keep `OPENAI_MODEL` configurable so the model can be changed without code edits. The LLM can interpret phrasing and make factual responses more natural; it does not calculate staffing or purchasing values. `store: false` is set for Responses API requests. The fallback keeps the demo functional if the key is absent or the request fails.
 
-### 5. Configure Meta WhatsApp Cloud API
+### 5. Test the WhatsApp forecast workflow (synthetic only)
 
-1. Create or select a Meta business portfolio and a WhatsApp Business Account. Start with Meta's test number while building.
-2. Create a Meta developer app and add the WhatsApp product. Record the app secret, access token, phone number ID, and the current Graph API version in `.env`.
-3. Add a random string to `WHATSAPP_VERIFY_TOKEN`. This is the webhook verification token you choose; it is separate from the Meta access token and app secret.
-4. Make the FastAPI service reachable at a **public HTTPS** URL. For local experiments use a reputable HTTPS tunnel; for a pilot deploy it behind a managed HTTPS endpoint. Meta cannot call `127.0.0.1`.
-5. In the Meta app webhook settings, enter `https://YOUR_HOST/webhooks/whatsapp` and the exact `WHATSAPP_VERIFY_TOKEN`. Subscribe to the `messages` field for the WhatsApp Business Account.
-6. Set `WHATSAPP_ALLOWED_NUMBERS` to the test manager's number including country code (digits; comma-separated for multiple managers). This allowlist is required before the webhook will respond.
-7. Set `WHATSAPP_MANAGER_MAP` to map that same number to the shared web manager ID, for example `12125550123=demo-gm`.
-8. Restart `uvicorn`, send a WhatsApp message to the test number, then test: “Are we okay today?”, “What if one person calls out?”, “Run scenario”, and “Cancel”.
-
-The webhook currently replies to inbound text and interactive quick-reply messages. It does not send proactive alerts or templates. Business-initiated messages outside WhatsApp's customer-support window require an approved template; add those only when proactive notifications are in scope.
+Follow the [development workflow guide](docs/whatsapp_forecast_workflow.md) for
+the runnable signed-webhook demo, strict accepted PDF profile, enrollment and
+separate worker. The default configuration does not contact Meta. Live mode is
+blocked with the development storage adapters even if credentials are present.
+A separate pilot business number, authorized Meta setup, durable hosting/storage,
+authenticated app access and an explicitly approved real-message test remain
+production gates. No actual number or account has been connected by this change.
 
 ### 6. Connect a web frontend to the API (optional)
 
@@ -82,12 +97,14 @@ The current Streamlit web app remains usable as-is and shares the same operation
 
 Send `X-API-Key: <COPILOT_API_KEY>` only from trusted server-side code. For an internet-facing web app, replace the prototype shared key with authenticated GM accounts and hotel/role authorization.
 
-## WhatsApp manager commands
+## WhatsApp forecast messages
 
-- Read-only questions: current status, room readiness, staffing explanation, inventory order.
-- Scenario proposals: call-outs, budget change, or tequila arrival timing. The bot asks for `RUN SCENARIO` or `CANCEL` before applying to that manager's session.
-- `RESET DEMO` clears that manager's session scenarios; it does not edit the workbook.
-- `APPROVE DRAFT` records an approval event only. No order is sent and no schedule is distributed.
+- Send the complete supported native-text forecast PDF to the enrolled business number.
+- Valid documents create a saved, versioned roster and same-sender PDF reply.
+- Unclear/invalid documents request correction; photos and scans require review.
+- Shortages are labeled **NEEDS ATTENTION**, not silently resolved.
+- Text/unsupported messages receive upload guidance; legacy scenario commands are no longer handled by the webhook.
+- The implementation currently runs with a fake transport only. See the guide before any live setup.
 
 ## Streamlit pages
 

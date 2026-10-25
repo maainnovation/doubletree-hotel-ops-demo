@@ -159,7 +159,7 @@ def _process_message(manager_id, message):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "whatsapp_configured": bool(os.getenv("WHATSAPP_ACCESS_TOKEN") and os.getenv("WHATSAPP_PHONE_NUMBER_ID")), "llm_configured": bool(os.getenv("OPENAI_API_KEY"))}
+    return {"status": "ok", "whatsapp_forecast_enabled": os.getenv("WHATSAPP_FORECAST_ENABLED", "0") == "1", "whatsapp_provider": os.getenv("WHATSAPP_PROVIDER", "fake"), "live_workflow_available": False, "llm_configured": bool(os.getenv("OPENAI_API_KEY"))}
 
 
 @app.get("/api/today")
@@ -209,53 +209,25 @@ def _extract_text(message):
     return ""
 
 
-async def _send_whatsapp_message(to, text):
-    token = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
-    phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
-    version = os.getenv("META_GRAPH_API_VERSION", "")
-    if not token or not phone_number_id or not version:
-        raise RuntimeError("WhatsApp send credentials are not configured")
-    url = f"https://graph.facebook.com/{version}/{phone_number_id}/messages"
-    async with httpx.AsyncClient(timeout=15) as client:
-        result = await client.post(url, headers={"Authorization": f"Bearer {token}"}, json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text[:4000]}})
-    result.raise_for_status()
-
-
 @app.post("/webhooks/whatsapp")
 async def receive_whatsapp_webhook(request: Request, x_hub_signature_256: str | None = Header(default=None)):
-    raw = await request.body()
+    if os.getenv("WHATSAPP_FORECAST_ENABLED", "0") != "1":
+        raise HTTPException(503, "WhatsApp forecast pilot is disabled")
+    # Read a bounded raw body before signature verification; never trust parsed
+    # JSON or start extraction/network work in the webhook process.
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > 1024 * 1024:
+            raise HTTPException(413, "Webhook body too large")
+        chunks.append(chunk)
+    raw = b"".join(chunks)
     if not _verify_meta_signature(raw, x_hub_signature_256):
         raise HTTPException(401, "Invalid webhook signature")
     try:
+        from services.whatsapp_store import WorkflowStore
         payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(400, "Invalid JSON") from exc
-    allowed = _allowed_managers()
-    for entry in payload.get("entry", []):
-        for change in entry.get("changes", []):
-            value = change.get("value", {})
-            expected_phone_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
-            actual_phone_id = value.get("metadata", {}).get("phone_number_id", "")
-            if expected_phone_id and actual_phone_id and actual_phone_id != expected_phone_id:
-                continue
-            for message in value.get("messages", []):
-                message_id = message.get("id")
-                phone = re.sub(r"\D", "", message.get("from", ""))
-                text = _extract_text(message)
-                if not message_id or not phone or not text or phone not in allowed:
-                    continue
-                if store.has_seen_message(message_id):
-                    continue
-                manager_id = _manager_id_for_phone(phone)
-                try:
-                    reply = _process_message(manager_id, text)
-                    await _send_whatsapp_message(phone, reply)
-                except Exception:
-                    # Avoid leaking tracebacks, workbook contents, or secrets to WhatsApp.
-                    reply = "I couldn’t complete that from the current demo data. Please check the web app or contact your administrator."
-                    try:
-                        await _send_whatsapp_message(phone, reply)
-                    except Exception:
-                        raise HTTPException(502, "Could not send WhatsApp reply")
-                store.mark_message_seen(message_id)
+        WorkflowStore(store.path).ingest(payload, datetime.now(timezone.utc).timestamp())
+    except (ValueError, TypeError, KeyError, OverflowError) as exc:
+        raise HTTPException(400, "Invalid webhook payload") from exc
     return {"status": "accepted"}
