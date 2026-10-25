@@ -259,12 +259,20 @@ class MetaWhatsAppProvider:
                            "document": {"id": media_id, "filename": filename, "caption": caption}}, idempotency_key)
 
 
-def provider_from_env(env: Mapping[str, str] | None = None) -> WhatsAppProvider:
+def provider_from_env(env: Mapping[str, str] | None = None, *, media_publisher=None) -> WhatsAppProvider:
     """Fail closed for unknown modes or incomplete live approval/configuration."""
     config = os.environ if env is None else env
     mode = config.get("WHATSAPP_PROVIDER", "fake")
     if mode == "fake":
         return FakeWhatsAppProvider()
+    if mode == "twilio":
+        from services.twilio_provider import TwilioWhatsAppProvider
+        if config.get("WHATSAPP_PRODUCTION_APPROVED") != "1" or media_publisher is None or getattr(media_publisher, "development_only", True):
+            raise ProviderError("Live Twilio requires approved production storage and a private media publisher; development adapters cannot send.")
+        required = ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_WHATSAPP_FROM", "TWILIO_STATUS_CALLBACK_URL", "TWILIO_WEBHOOK_URL")
+        if any(not config.get(name, "").strip() for name in required):
+            raise ProviderError("Live Twilio requires complete server-side configuration.")
+        return TwilioWhatsAppProvider(config[required[0]], config[required[1]], config[required[2]], media_publisher=media_publisher, status_callback_url=config[required[3]], production_approved=True)
     if mode != "meta" or config.get("WHATSAPP_PRODUCTION_APPROVED") != "1":
         raise ProviderError("Live WhatsApp transport is disabled pending deployment approval.")
     required = ("WHATSAPP_ACCESS_TOKEN", "WHATSAPP_PHONE_NUMBER_ID", "META_GRAPH_API_VERSION",

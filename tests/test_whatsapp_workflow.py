@@ -625,13 +625,14 @@ def test_shared_parameter_merge_preserves_newer_staff_and_stale_form_is_rejected
         store.save_staff_settings("gm",old,dataset_mode="demo",expected_revision=old["_settings_revision"])
 
 
-def test_provider_business_id_must_match_job(system):
+def test_provider_business_id_must_match_job_without_consuming_another_providers_work(system):
     store, files, provider, worker, client, clock = system
     provider.phone_number_id = "999999999999"
     upload(system)
     worker.drain_ready()
     assert not provider.sent and not store.list_weekly_roster_versions("gm")
-    assert store.rows("wa_jobs")[0]["error_code"] == "provider_number_mismatch"
+    assert store.rows("wa_jobs")[0]["status"] == "pending"
+    assert store.rows("wa_jobs")[0]["error_code"] is None
 
 
 def test_settings_revert_after_stale_text_does_not_suppress_requested_pdf(system):

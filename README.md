@@ -144,3 +144,10 @@ For optional private localhost vision testing, use a server-side key already con
 - “Set the budget to $9,000.”
 
 Session parameter and chat edits survive navigation within the current browser session. Staff & Settings and saved weekly roster versions persist in SQLite and do not modify the workbook. Undo restores the last chat edit only if no later parameter or scenario changes occurred. Readiness uses a simplified room assignment model; breaks and other duties reduce capacity but are not scheduled on its timeline. The weekly generator reports whether the current aggregate demand and editable staffing constraints appear covered; it does not build room-level assignments, publish/distribute schedules, or replace manager review. Run locally with `streamlit run app.py`. SQLite persistence is suitable for a single local instance, but a hosted Streamlit filesystem may be ephemeral across restarts and does not coordinate multiple replicas; use durable managed storage for hosted operational data. The public demo has no sign-in, so do not enter real employee or hotel operating data.
+
+### Twilio PDF transport (synthetic, live disabled)
+
+The same forecast/roster workflow also has a Twilio adapter with signed form
+webhooks, account/sender-bound media, expiring private PDF access and mocked
+end-to-end coverage. It does not establish this account's trial PDF eligibility.
+See [Twilio implementation, demo and live gates](docs/twilio_pdf_workflow.md).

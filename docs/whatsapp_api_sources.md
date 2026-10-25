@@ -56,3 +56,9 @@ were unavailable), so an optional unverified field was not added. Status events
 can reconcile known returned message IDs; an acknowledgement lost before its ID
 is saved may require operator investigation and cannot be advertised as automatic
 reconciliation. Keep that outbox entry blocked rather than re-sending it.
+
+## Alternative Twilio adapter
+
+The separate [Twilio PDF guide](twilio_pdf_workflow.md) records current official
+API/security sources, synthetic verification and account-specific trial limits.
+Meta remains intact; neither live adapter is enabled by default.

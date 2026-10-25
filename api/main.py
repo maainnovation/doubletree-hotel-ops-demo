@@ -4,11 +4,13 @@ import hmac
 import json
 import os
 import re
+import ipaddress
 from datetime import datetime, timezone
+from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -231,3 +233,87 @@ async def receive_whatsapp_webhook(request: Request, x_hub_signature_256: str | 
     except (ValueError, TypeError, KeyError, OverflowError) as exc:
         raise HTTPException(400, "Invalid webhook payload") from exc
     return {"status": "accepted"}
+
+
+async def _twilio_signed_form(request: Request, signature: str | None, url_setting: str):
+    """Pin exact configured external URL; never trust Host/Forwarded for signing."""
+    from services.twilio_provider import validate_twilio_signature
+    if os.getenv("WHATSAPP_FORECAST_ENABLED", "0") != "1" or os.getenv("TWILIO_WEBHOOK_ENABLED", "0") != "1":
+        raise HTTPException(503, "Twilio forecast pilot is disabled")
+    if request.headers.get("content-type", "").split(";", 1)[0].lower() != "application/x-www-form-urlencoded":
+        raise HTTPException(415, "Expected form-encoded webhook")
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > 64 * 1024:
+            raise HTTPException(413, "Webhook body too large")
+        chunks.append(chunk)
+    try:
+        raw = b"".join(chunks).decode("utf-8", errors="strict")
+        if re.search(r"%(?![0-9a-fA-F]{2})", raw):
+            raise ValueError("Invalid form escaping")
+        pairs = parse_qsl(raw, keep_blank_values=True, strict_parsing=True, encoding="utf-8", errors="strict", max_num_fields=100)
+        form = dict(pairs)
+        if len(pairs) != len(form) or any(not key or len(key) > 128 or len(value) > 8192 for key, value in pairs):
+            raise ValueError("Duplicate or oversized form field")
+        external_url = os.getenv(url_setting, "")
+        configured = urlsplit(external_url)
+        if configured.path != request.url.path or configured.query != request.scope.get("query_string", b"").decode("ascii"):
+            raise ValueError("Configured webhook path/query mismatch")
+    except (ValueError, UnicodeError):
+        raise HTTPException(400, "Invalid webhook form") from None
+    if not validate_twilio_signature(os.getenv("TWILIO_AUTH_TOKEN", ""), external_url, form, signature or ""):
+        raise HTTPException(401, "Invalid webhook signature")
+    return form
+
+
+@app.post("/webhooks/twilio/whatsapp")
+async def receive_twilio_whatsapp(request: Request, x_twilio_signature: str | None = Header(default=None)):
+    form = await _twilio_signed_form(request, x_twilio_signature, "TWILIO_WEBHOOK_URL")
+    from services.whatsapp_provider import ProviderError
+    try:
+        from services.whatsapp_store import WorkflowStore
+        WorkflowStore(store.path).ingest_twilio(form, datetime.now(timezone.utc).timestamp(), account_sid=os.getenv("TWILIO_ACCOUNT_SID", ""), business_sender=os.getenv("TWILIO_WHATSAPP_FROM", ""))
+    except (ValueError, TypeError, KeyError):
+        raise HTTPException(400, "Invalid Twilio webhook payload") from None
+    except ProviderError:
+        raise HTTPException(503, "Twilio configuration is incomplete") from None
+    return Response('<?xml version="1.0" encoding="UTF-8"?><Response/>', media_type="application/xml")
+
+
+@app.post("/webhooks/twilio/status")
+async def receive_twilio_status(request: Request, x_twilio_signature: str | None = Header(default=None)):
+    form = await _twilio_signed_form(request, x_twilio_signature, "TWILIO_STATUS_CALLBACK_URL")
+    from services.whatsapp_provider import ProviderError
+    try:
+        from services.whatsapp_store import WorkflowStore
+        WorkflowStore(store.path).twilio_status(form, datetime.now(timezone.utc).timestamp(), account_sid=os.getenv("TWILIO_ACCOUNT_SID", ""), business_sender=os.getenv("TWILIO_WHATSAPP_FROM", ""))
+    except (ValueError, TypeError, KeyError):
+        raise HTTPException(400, "Invalid Twilio status payload") from None
+    except ProviderError:
+        raise HTTPException(503, "Twilio configuration is incomplete") from None
+    return Response(status_code=204)
+
+
+def _twilio_media_publisher():
+    from services.twilio_media import TwilioMediaPublisher
+    from services.whatsapp_store import PrivateFileStore, WorkflowStore
+    return TwilioMediaPublisher(WorkflowStore(store.path), PrivateFileStore(os.getenv("WHATSAPP_PRIVATE_STORAGE", os.path.join(ROOT, "data", "whatsapp-private"))), os.getenv("TWILIO_MEDIA_BASE_URL", ""))
+
+
+@app.api_route("/media/twilio/{token}/{filename}", methods=["GET", "HEAD"])
+def twilio_document_media(token: str, filename: str, request: Request):
+    # No public real-data hosting in this development adapter. Even a valid
+    # capability is denied to non-loopback clients; proxies are NOT trusted.
+    try:
+        local = bool(request.client) and ipaddress.ip_address(request.client.host).is_loopback
+    except ValueError:
+        local = False
+    if not local or os.getenv("TWILIO_DEV_MEDIA_ENABLED", "0") != "1" or os.getenv("WHATSAPP_FORECAST_ENABLED", "0") != "1":
+        raise HTTPException(404, "Media unavailable")
+    try:
+        from services.twilio_media import MediaGrantError
+        data = _twilio_media_publisher().get(token, filename, head=request.method == "HEAD")
+    except (ValueError, MediaGrantError, OSError):
+        raise HTTPException(404, "Media unavailable") from None
+    return Response(b"" if request.method == "HEAD" else data, media_type="application/pdf", headers={"Content-Length": str(len(data)), "Content-Disposition": f'inline; filename="{filename}"', "Cache-Control": "private, no-store, max-age=0", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"})

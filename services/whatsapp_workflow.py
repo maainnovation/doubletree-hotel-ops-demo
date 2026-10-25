@@ -28,7 +28,8 @@ class ForecastWorker:
 
     def process_one(self):
         now = self.clock()
-        job = self.store.claim_job(now)
+        phone_id = getattr(self.provider, "phone_number_id", None)
+        job = self.store.claim_job(now, phone_id, exclude_twilio=phone_id is None)
         if not job:
             return False
         try:
@@ -43,6 +44,25 @@ class ForecastWorker:
             if media.get("_enrollment_binding") != self.store.enrollment_binding(enrolled):
                 self._correction(job, "The enrolled hotel setup or report format changed after this upload. No roster was changed. Please resend the complete forecast after the administrator confirms setup.")
                 return True
+            if job["phone_number_id"].startswith("twilio:"):
+                if media.get("_provider") != "twilio":
+                    self.store.job_failed(job, now, "invalid_provider_binding", retry=False)
+                    return True
+                try:
+                    inbound_at = self.provider.verify_inbound_message(job["message_id"], job["sender"], now)
+                except RetryableProviderError:
+                    raise
+                except (ProviderError, AttributeError):
+                    self.store.job_failed(job, now, "inbound_identity_or_window_unverified", retry=False)
+                    return True
+                with self.store._connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    current = self.store._enrollment(db, job["phone_number_id"], job["sender"])
+                    if not self._owns_job(db, job) or not current or self.store.enrollment_binding(current) != media["_enrollment_binding"]:
+                        return True
+                    db.execute("UPDATE wa_jobs SET inbound_at=? WHERE id=?", (inbound_at, job["id"]))
+                    db.execute("UPDATE wa_senders SET last_inbound=MAX(last_inbound,?) WHERE phone_number_id=? AND sender=?", (min(inbound_at, now), job["phone_number_id"], job["sender"]))
+                job["inbound_at"] = inbound_at
             if media["type"] == "unsupported":
                 self._correction(job, "Please send the complete standard native-text forecast PDF, including Hotel code, all seven Friday–Thursday dates and all forecast counts. Photos/scans need review; no roster was changed.")
                 return True
@@ -60,7 +80,9 @@ class ForecastWorker:
             if not isinstance(data, bytes) or not data or len(data) > maximum:
                 raise ForecastNeedsCorrection("The file is empty or too large. Resend a PDF under 10 MB or an image under 5 MB.")
             actual_hash = hashlib.sha256(data).digest()
-            if not hmac.compare_digest(actual_hash, base64.b64decode(media["sha256"], validate=True)):
+            # Meta supplies a signed checksum; Twilio supplies an authenticated
+            # immutable media URL, not a checksum. Always retain our content hash.
+            if not job["phone_number_id"].startswith("twilio:") and not hmac.compare_digest(actual_hash, base64.b64decode(media["sha256"], validate=True)):
                 raise ForecastNeedsCorrection("The uploaded file failed its integrity check. Please resend the original PDF.")
             source_hash = actual_hash.hex()
             rows = validate_whatsapp_forecast(data, media["mime"], enrolled["hotel_code"], capacity, datetime.fromtimestamp(now, timezone.utc), report_profile=enrolled["report_profile"], hotel_name=enrolled["hotel_name"])
@@ -119,7 +141,7 @@ class ForecastWorker:
                 raise ValueError("Saved Parameters/staff changed during validation; retry against the latest revision")
             staff = json.loads(staff_row["payload"])
             staff["dataset_mode"] = staff_row["dataset_mode"]
-            duplicate = db.execute("SELECT job_id FROM wa_documents WHERE tenant_id=? AND sender=? AND source_hash=?", (job["tenant_id"], job["sender"], digest)).fetchone()
+            duplicate = db.execute("SELECT d.job_id FROM wa_documents d JOIN wa_jobs j ON j.id=d.job_id WHERE d.tenant_id=? AND d.sender=? AND d.source_hash=? AND j.phone_number_id=?", (job["tenant_id"], job["sender"], digest, job["phone_number_id"])).fetchone()
             if duplicate:
                 previous_job = db.execute("SELECT media_json,week_start,version FROM wa_jobs WHERE id=?", (duplicate["job_id"],)).fetchone()
                 previous_binding = json.loads(previous_job["media_json"]).get("_enrollment_binding") if previous_job else None
@@ -163,7 +185,8 @@ class ForecastWorker:
             _, pdf = build_exports(roster)
             pdf_key = self.files.put(job["tenant_id"], pdf, "pdf")
             caption = ("NEEDS ATTENTION: shortages or constraints remain; this is not a confirmed workable schedule. " if roster["workflow_status"] == "needs_attention" else "Calculated roster; review before operational use. ") + f"{enrolled['hotel_name']} | {week_start} to {roster['week_end']} | version {roster['version']}. Saved in the app. Fictional development pilot."
-            self.store.add_outbox(db, job, now, caption, pdf_key, f"weekly-roster-{week_start}-v{roster['version']}.pdf")
+            filename = f"roster-{week_start.replace('-', '')}.pdf" if job["phone_number_id"].startswith("twilio:") else f"weekly-roster-{week_start}-v{roster['version']}.pdf"
+            self.store.add_outbox(db, job, now, caption, pdf_key, filename)
             db.execute("INSERT INTO wa_documents(tenant_id,sender,source_hash,job_id) VALUES(?,?,?,?) ON CONFLICT(tenant_id,sender,source_hash) DO UPDATE SET job_id=excluded.job_id", (job["tenant_id"], job["sender"], digest, job["id"]))
             db.execute("UPDATE wa_jobs SET status=?,source_hash=?,source_key=?,week_start=?,version=?,lease_until=NULL WHERE id=?", (roster["workflow_status"], digest, source_key, week_start, roster["version"], job["id"]))
 
@@ -174,8 +197,9 @@ class ForecastWorker:
             db.execute("BEGIN IMMEDIATE")
             # A crashed/overdue send is NOT a safe retry: Meta has no send
             # idempotency guarantee. Reconcile signed status callbacks/operator.
-            db.execute("UPDATE wa_outbox SET status='reconciliation_required',error_code='send_outcome_unknown' WHERE status='sending' AND updated_at<?", (now - 300,))
-            row = db.execute("SELECT * FROM wa_outbox WHERE status IN ('pending','retry') AND available_at<=? AND attempts<5 ORDER BY available_at,id LIMIT 1", (now,)).fetchone()
+            phone_id = getattr(self.provider, "phone_number_id", None)
+            db.execute("UPDATE wa_outbox SET status='reconciliation_required',error_code='send_outcome_unknown' WHERE status='sending' AND updated_at<? AND (? IS NULL OR phone_number_id=?) AND (?=0 OR phone_number_id NOT LIKE 'twilio:%')", (now - 300, phone_id, phone_id, phone_id is None))
+            row = db.execute("SELECT * FROM wa_outbox WHERE status IN ('pending','retry') AND available_at<=? AND attempts<5 AND (? IS NULL OR phone_number_id=?) AND (?=0 OR phone_number_id NOT LIKE 'twilio:%') ORDER BY available_at,id LIMIT 1", (now, phone_id, phone_id, phone_id is None)).fetchone()
             if not row:
                 return False
             item = dict(row)

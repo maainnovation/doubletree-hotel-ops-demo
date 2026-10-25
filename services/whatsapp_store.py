@@ -124,8 +124,8 @@ class WorkflowStore(StateStore):
             db.execute("INSERT INTO wa_tenants(tenant_id,manager_id,hotel_code,hotel_name,room_capacity,report_profile) VALUES(?,?,?,?,?,?)", (tenant_id, manager_id, hotel_code, hotel_name, 0, report_profile))
 
     def enroll_sender(self, *, tenant_id, phone_number_id, sender):
-        if not re.fullmatch(r"[0-9]{5,32}", phone_number_id) or not re.fullmatch(r"[0-9]{7,15}", sender):
-            raise ValueError("Exact numeric business phone ID and E.164 sender digits required")
+        if not isinstance(phone_number_id, str) or not re.fullmatch(r"(?:[0-9]{5,32}|twilio:AC[0-9a-fA-F]{32}:[1-9][0-9]{6,14})", phone_number_id) or not re.fullmatch(r"[0-9]{7,15}", sender):
+            raise ValueError("Exact provider-scoped business ID and E.164 sender digits required")
         with self._connect() as db:
             if not db.execute("SELECT 1 FROM wa_tenants WHERE tenant_id=? AND enabled=1", (tenant_id,)).fetchone():
                 raise ValueError("Tenant must be explicitly enrolled first")
@@ -213,6 +213,59 @@ class WorkflowStore(StateStore):
                             db.execute("UPDATE wa_senders SET last_inbound=MAX(last_inbound,?) WHERE phone_number_id=? AND sender=?", (min(timestamp, now), phone_id, sender))
         return accepted
 
+    def ingest_twilio(self, form, now: float, *, account_sid: str, business_sender: str) -> int:
+        """Signed form envelope only. No fetch; receipt time never opens a send window.
+
+        Twilio does not sign a timestamp. The worker must verify the immutable
+        Message resource and its real creation time before processing/replying.
+        """
+        from services.twilio_provider import twilio_business_id
+        phone_id = twilio_business_id(account_sid, business_sender)
+        if form.get("AccountSid") != account_sid or form.get("To") != "whatsapp:+" + phone_id.rsplit(":", 1)[1]:
+            return 0
+        sender = form.get("From", "")
+        message_id = form.get("MessageSid", "")
+        if not re.fullmatch(r"whatsapp:\+[1-9][0-9]{6,14}", sender) or not re.fullmatch(r"(?:SM|MM)[0-9a-fA-F]{32}", message_id):
+            raise ValueError("Invalid Twilio message identity")
+        if form.get("SmsMessageSid", message_id) != message_id or form.get("SmsSid", message_id) != message_id:
+            raise ValueError("Conflicting Twilio message identity")
+        sender = sender.removeprefix("whatsapp:+")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            enrolled = self._enrollment(db, phone_id, sender)
+            if not enrolled:
+                return 0
+            media = {"type": "unsupported", "_provider": "twilio"}
+            if form.get("NumMedia") == "1":
+                url, mime = form.get("MediaUrl0", ""), form.get("MediaContentType0", "")
+                expected = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages/{message_id}/Media/"
+                if not url.startswith(expected) or not re.fullmatch(r"ME[0-9a-fA-F]{32}", url[len(expected):]):
+                    raise ValueError("Invalid account/message-bound media URL")
+                if mime in {"application/pdf", "image/jpeg", "image/png"}:
+                    media.update(type="document" if mime == "application/pdf" else "image", id=url, mime=mime)
+            elif form.get("NumMedia") != "0":
+                raise ValueError("One media attachment per message is required")
+            if any(re.fullmatch(r"Media(?:Url|ContentType)[1-9][0-9]*", key) for key in form):
+                raise ValueError("Unexpected extra media")
+            media["_enrolled_report_profile"] = enrolled["report_profile"]
+            media["_enrollment_binding"] = self.enrollment_binding(enrolled)
+            return db.execute("INSERT OR IGNORE INTO wa_jobs(id,phone_number_id,message_id,sender,tenant_id,inbound_at,media_json,available_at) VALUES(?,?,?,?,?,?,?,?)", (uuid.uuid4().hex, phone_id, message_id, sender, enrolled["tenant_id"], now, json.dumps(media), now)).rowcount
+
+    def twilio_status(self, form, now: float, *, account_sid: str, business_sender: str):
+        """Signed callbacks reconcile known IDs only, never unknown/lost acknowledgements."""
+        from services.twilio_provider import twilio_business_id
+        phone_id = twilio_business_id(account_sid, business_sender)
+        if form.get("AccountSid") != account_sid or form.get("From") != "whatsapp:+" + phone_id.rsplit(":", 1)[1]:
+            return
+        recipient, sid = form.get("To", ""), form.get("MessageSid", "")
+        if not re.fullmatch(r"whatsapp:\+[1-9][0-9]{6,14}", recipient) or not re.fullmatch(r"(?:SM|MM)[0-9a-fA-F]{32}", sid):
+            raise ValueError("Invalid status identity")
+        status = form.get("MessageStatus")
+        if status == "undelivered":
+            status = "failed"
+        with self._connect() as db:
+            self._statuses(db, phone_id, [{"recipient_id": recipient.removeprefix("whatsapp:+"), "id": sid, "status": status}], now)
+
     @staticmethod
     def _statuses(db, phone_id, statuses, now):
         if not isinstance(statuses, list) or len(statuses) > 100:
@@ -237,12 +290,12 @@ class WorkflowStore(StateStore):
                 continue
             db.execute("UPDATE wa_outbox SET status=?,provider_message_id=?,updated_at=? WHERE id=?", ("delivery_failed" if incoming == "failed" else incoming, provider_id, now, row["id"]))
 
-    def claim_job(self, now):
+    def claim_job(self, now, phone_number_id=None, *, exclude_twilio=False):
         with self._connect() as db:
             db.row_factory = sqlite3.Row
             db.execute("BEGIN IMMEDIATE")
-            db.execute("UPDATE wa_jobs SET status='failed',error_code='processing_attempts_exhausted',lease_until=NULL WHERE status='processing' AND lease_until<? AND attempts>=5", (now,))
-            row = db.execute("SELECT * FROM wa_jobs WHERE ((status IN ('pending','retry') AND available_at<=?) OR (status='processing' AND lease_until<?)) AND attempts<5 ORDER BY available_at,id LIMIT 1", (now, now)).fetchone()
+            db.execute("UPDATE wa_jobs SET status='failed',error_code='processing_attempts_exhausted',lease_until=NULL WHERE status='processing' AND lease_until<? AND attempts>=5 AND (? IS NULL OR phone_number_id=?) AND (?=0 OR phone_number_id NOT LIKE 'twilio:%')", (now, phone_number_id, phone_number_id, exclude_twilio))
+            row = db.execute("SELECT * FROM wa_jobs WHERE ((status IN ('pending','retry') AND available_at<=?) OR (status='processing' AND lease_until<?)) AND attempts<5 AND (? IS NULL OR phone_number_id=?) AND (?=0 OR phone_number_id NOT LIKE 'twilio:%') ORDER BY available_at,id LIMIT 1", (now, now, phone_number_id, phone_number_id, exclude_twilio)).fetchone()
             if not row:
                 return None
             token = uuid.uuid4().hex
