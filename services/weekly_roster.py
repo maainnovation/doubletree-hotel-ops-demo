@@ -332,43 +332,116 @@ def weekly_grid(schedule: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]
 
 
 def build_exports(roster: dict[str, Any]) -> tuple[bytes, bytes]:
-    """Produce reviewable Excel and PDF weekly shift rosters without room assignments."""
+    """Export the captured roster, daily calculations, locks, and honest gaps."""
     from io import BytesIO
+    from pathlib import Path
+    from xml.sax.saxutils import escape
     import pandas as pd
+    import reportlab
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import landscape, letter
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
 
+    summary = roster_calculation_summary(roster)
     xlsx_out = BytesIO()
     with pd.ExcelWriter(xlsx_out, engine="openpyxl") as writer:
         pd.DataFrame(roster["forecast"]).to_excel(writer, sheet_name="Forecast", index=False)
         pd.DataFrame(roster["schedule"]).to_excel(writer, sheet_name="Weekly Shift Roster", index=False)
         grid_rows = [row for rows in weekly_grid(roster["schedule"]).values() for row in rows]
         pd.DataFrame(grid_rows).to_excel(writer, sheet_name="Fri-Thu Grid", index=False)
+        pd.DataFrame(summary).to_excel(writer, sheet_name="Daily Calculations", index=False)
         pd.DataFrame({"Constraint": roster.get("constraints", []) or ["None identified"]}).to_excel(writer, sheet_name="Validation", index=False)
     pdf_out = BytesIO()
-    doc = SimpleDocTemplate(pdf_out, pagesize=landscape(letter), rightMargin=24, leftMargin=24, topMargin=24, bottomMargin=24)
+    doc = SimpleDocTemplate(pdf_out, pagesize=landscape(letter), rightMargin=24, leftMargin=24, topMargin=24, bottomMargin=30)
+    # Embed ReportLab's bundled fonts so Linux/headless renderers do not rely on
+    # platform Helvetica substitution (which can corrupt spacing in exports).
+    font_dir = Path(reportlab.__file__).parent / "fonts"
+    for name, filename in (("RosterSans", "Vera.ttf"), ("RosterSans-Bold", "VeraBd.ttf"),
+                           ("RosterSans-Italic", "VeraIt.ttf"), ("RosterSans-BoldItalic", "VeraBI.ttf")):
+        if name not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(TTFont(name, str(font_dir / filename)))
+    pdfmetrics.registerFontFamily("RosterSans", normal="RosterSans", bold="RosterSans-Bold",
+                                italic="RosterSans-Italic", boldItalic="RosterSans-BoldItalic")
     styles = getSampleStyleSheet()
-    story = [Paragraph("Weekly Employee Shift Roster", styles["Title"]), Paragraph(f"{roster['week_start']} – {roster['week_end']} · {'Feasible under current inputs' if roster['feasible'] else 'INCOMPLETE / CONSTRAINTS UNMET'}", styles["Normal"]), Spacer(1, 12)]
+    for name in ("Normal", "BodyText", "Italic"):
+        styles[name].fontName = "RosterSans"
+    for name in ("Title", "Heading1", "Heading2"):
+        styles[name].fontName = "RosterSans-Bold"
+    styles.add(ParagraphStyle("RosterCell", parent=styles["Normal"], fontSize=7, leading=8.5))
+    styles.add(ParagraphStyle("SummaryCell", parent=styles["Normal"], fontSize=8, leading=10))
+    styles.add(ParagraphStyle("SmallNote", parent=styles["Normal"], fontSize=8, leading=10))
+
+    def text(value):
+        # Source documents and saved staff labels are data, never ReportLab XML.
+        return escape(str(value)).replace("\n", "<br/>")
+
+    def cell(value, style="RosterCell"):
+        return Paragraph(text(value), styles[style])
+
+    source = roster.get("source") if isinstance(roster.get("source"), dict) else {}
+    metadata = []
+    hotel_name = source.get("hotel_name") or roster.get("hotel_name")
+    if hotel_name:
+        metadata.append(str(hotel_name))
+    if roster.get("version"):
+        metadata.append(f"Version {roster['version']}")
+    if source.get("channel") == "whatsapp":
+        metadata.append("Received via WhatsApp")
+    status = "Covered under saved assumptions" if roster["feasible"] else "NEEDS ATTENTION - INCOMPLETE / CONSTRAINTS UNMET"
+    story = [Paragraph("Weekly Employee Shift Roster", styles["Title"]),
+             cell(f"{roster['week_start']} to {roster['week_end']} | {status}", "SummaryCell")]
+    if metadata:
+        story.append(cell(" | ".join(metadata), "SummaryCell"))
+    story.append(Spacer(1, 10))
     dates = [row["date"] for row in roster["forecast"]]
     date_headers = [datetime.strptime(d, "%Y-%m-%d").strftime("%a %m/%d") for d in dates]
     table_data = [["Role / employee", "Staff ID", *date_headers, "Paid h", "Prod h"]]
     role_row_indices = []
+    locked = {(str(row["staff_id"]), row["date"]) for row in roster["schedule"] if row.get("locked")}
     for role, employees in weekly_grid(roster["schedule"]).items():
         role_row_indices.append(len(table_data))
-        table_data.append([role, *([""] * (len(date_headers) + 3))])
+        table_data.append([cell(role), *([""] * (len(date_headers) + 3))])
         for employee in employees:
-            table_data.append([employee["Employee"], employee["Staff ID"], *[employee[d] for d in dates],
+            shifts = [str(employee[d]).replace("–", "-").removeprefix("SHIFT ") + (" *" if (employee["Staff ID"], d) in locked else "") for d in dates]
+            table_data.append([cell(employee["Employee"]), cell(employee["Staff ID"]), *[cell(value) for value in shifts],
                                f"{employee['Paid hours']:.1f}", f"{employee['Productive hours']:.1f}"])
-    table = Table(table_data, repeatRows=1, colWidths=[80, 62, *([62] * 7), 45, 45])
-    styles_list = [("BACKGROUND", (0,0),(-1,0), colors.HexColor("#154734")), ("TEXTCOLOR",(0,0),(-1,0),colors.white), ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"), ("FONTSIZE",(0,0),(-1,-1),6.5), ("GRID",(0,0),(-1,-1),0.25,colors.grey), ("VALIGN",(0,0),(-1,-1),"MIDDLE"), ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#F2F5F3")])]
+    table = Table(table_data, repeatRows=1, colWidths=[114, 74, *([65] * 7), 46, 46])
+    styles_list = [("BACKGROUND", (0,0),(-1,0), colors.HexColor("#154734")), ("TEXTCOLOR",(0,0),(-1,0),colors.white), ("FONTNAME",(0,0),(-1,-1),"RosterSans"), ("FONTNAME",(0,0),(-1,0),"RosterSans-Bold"), ("FONTSIZE",(0,0),(-1,-1),7), ("GRID",(0,0),(-1,-1),0.25,colors.grey), ("VALIGN",(0,0),(-1,-1),"MIDDLE"), ("TOPPADDING",(0,0),(-1,-1),2), ("BOTTOMPADDING",(0,0),(-1,-1),2), ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#F2F5F3")])]
     for index in role_row_indices:
-        styles_list.extend([("SPAN", (0,index), (1,index)), ("SPAN", (2,index), (-1,index)), ("BACKGROUND", (0,index), (-1,index), colors.HexColor("#E8F0EC")), ("FONTNAME", (0,index), (-1,index), "Helvetica-Bold")])
+        styles_list.extend([("SPAN", (0,index), (1,index)), ("SPAN", (2,index), (-1,index)), ("BACKGROUND", (0,index), (-1,index), colors.HexColor("#E8F0EC")), ("FONTNAME", (0,index), (-1,index), "RosterSans-Bold")])
     table.setStyle(TableStyle(styles_list))
-    story.append(table)
-    if roster.get("constraints"):
-        story.extend([Spacer(1, 12), Paragraph("Constraints and uncovered demand", styles["Heading2"]), Paragraph("<br/>".join(roster["constraints"]), styles["BodyText"])])
-    story.extend([Spacer(1, 10), Paragraph("DEMO ASSUMPTIONS · Aggregate forecast counts are not room-level assignments. Review and confirm before operational use.", styles["Italic"])])
-    doc.build(story)
+    story.extend([table, Spacer(1, 8), cell("Times indicate scheduled SHIFT; * Preserved locked assignment. Paid hours and productive cleaning time differ; non-cleaning roles do not cover room-cleaning demand.", "SmallNote")])
+    story.extend([PageBreak(), Paragraph("Day-by-day calculation summary", styles["Heading1"]),
+                  cell("Calculated from this version's saved forecast, staff availability, and settings. Arrivals are not additional checkout cleans. Required headcount rounds up a standard productive shift; eligibility, hour limits, and locks still apply.", "SummaryCell"), Spacer(1, 10)])
+    if summary:
+        calculations = [["Day", "Cleaning workload (minutes)", "Required / scheduled", "Coverage / attention"]]
+        for day in summary:
+            calculations.append([
+                cell(f"{day['weekday']} {day['date']}", "SummaryCell"),
+                cell(f"{day['checkout_rooms']:g} checkouts x {day['checkout_minutes']:g} + {day['stayover_rooms']:g} stayovers x {day['stayover_minutes']:g} = {day['demand_minutes']:,.0f} min", "SummaryCell"),
+                cell(f"{day['demand_minutes']:,.0f} / {day['productive_minutes_per_shift']:g} min per shift, round up; minimum {day['minimum_housekeepers']}. Needed {day['required_housekeepers']}; scheduled {day['scheduled_housekeepers']}.", "SummaryCell"),
+                cell(f"Scheduled {day['scheduled_productive_minutes']:,.0f} min. Uncovered {day['uncovered_minutes']:,.0f} min. {day['status']}.", "SummaryCell"),
+            ])
+        summary_table = Table(calculations, repeatRows=1, colWidths=[98, 230, 220, 187])
+        summary_table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#154734")), ("TEXTCOLOR",(0,0),(-1,0),colors.white), ("FONTNAME",(0,0),(-1,0),"RosterSans-Bold"), ("FONTSIZE",(0,0),(-1,0),8), ("GRID",(0,0),(-1,-1),0.25,colors.grey), ("VALIGN",(0,0),(-1,-1),"TOP"), ("TOPPADDING",(0,0),(-1,-1),6), ("BOTTOMPADDING",(0,0),(-1,-1),6), ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#F2F5F3")])]))
+        story.append(summary_table)
+    else:
+        story.append(cell("This older saved version has no captured calculation inputs. Regenerate it before relying on a daily explanation.", "SummaryCell"))
+    story.extend([Spacer(1, 12), Paragraph("Constraints and uncovered demand", styles["Heading2"])])
+    for constraint in roster.get("constraints", []) or ["None identified under the saved assumptions. This is not a guarantee of operational readiness."]:
+        story.extend([cell(constraint, "SummaryCell"), Spacer(1, 3)])
+    story.extend([Spacer(1, 10), cell("DEMO ASSUMPTIONS - Aggregate forecast counts are not room-level assignments. Review and confirm before operational use. Needs-attention rosters have not silently solved shortages or lock conflicts.", "SmallNote")])
+
+    def footer(canvas, document):
+        canvas.saveState()
+        canvas.setFont("RosterSans", 7)
+        canvas.setFillColor(colors.HexColor("#58655F"))
+        canvas.drawString(24, 16, "Hotel Operations Copilot | Synthetic / development workflow")
+        canvas.drawRightString(768, 16, f"Page {document.page}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
     return xlsx_out.getvalue(), pdf_out.getvalue()

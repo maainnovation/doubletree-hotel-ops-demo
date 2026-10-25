@@ -19,6 +19,7 @@ from services.operations import build_snapshot
 from copilot.responses import housekeeping_response
 from copilot.scenarios import initial_scenarios
 from services.staff_settings import demo_defaults, validate_staff_settings, clean_payload, DEMO_SEED_VERSION
+from services.hotel_parameters import SHARED_PARAMETER_KEYS, shared_parameters_from_staff
 import json
 import pandas as pd
 import hashlib
@@ -55,17 +56,61 @@ except StreamlitSecretNotFoundError:
 # a separate anonymous state record for each Streamlit browser session.
 WEB_MANAGER_ID = os.getenv("WEB_MANAGER_ID") or st.session_state.setdefault("web_manager_id", uuid.uuid4().hex)
 
+# Enrollment must never turn this unauthenticated public demo into a route to
+# an enrolled manager's staff, settings, forecasts, or saved roster versions.
+# This guard is independent of the optional inbox flag and precedes state reads.
+whatsapp_linked_manager = state_store.is_whatsapp_manager(WEB_MANAGER_ID)
+if whatsapp_linked_manager and not is_loopback_address(getattr(st.context, "ip_address", None)):
+    st.error("WhatsApp-linked data is available only in the local development app. Authenticated production access is not configured.")
+    st.stop()
+
 persisted_state = state_store.get_manager(WEB_MANAGER_ID)
 staff_record = state_store.get_staff_settings(WEB_MANAGER_ID)
 if staff_record is None:
     staff_record = demo_defaults()
     state_store.save_staff_settings(WEB_MANAGER_ID, staff_record, DEMO_SEED_VERSION, dataset_mode="demo")
+    staff_record = state_store.get_staff_settings(WEB_MANAGER_ID)
 else:
     staff_record["dataset_mode"] = staff_record.get("_dataset_mode", "operational")
+# The user explicitly confirmed 292 total rooms for this built-in fictional
+# hotel. Seed that approval once, not by summing room-service counts. Never
+# migrate another workbook/tenant, operational data, or an explicitly set/cleared
+# inventory value. WhatsApp setup must use that hotel's own saved Parameters.
+inventory = staff_record.get("settings", {}).get("hotel_inventory", {})
+if (DATA_PATH.resolve() == (ROOT / "data" / "Hotel_Ops_Demo_Data.xlsx").resolve()
+        and not whatsapp_linked_manager
+        and staff_record.get("_dataset_mode") == "demo"
+        and staff_record.get("_demo_seed_version") == DEMO_SEED_VERSION
+        and isinstance(inventory, dict) and "room_capacity" not in inventory):
+    try:
+        staff_record = state_store.save_hotel_parameters(WEB_MANAGER_ID, {"room_capacity": 292},
+                                                        expected_revision=staff_record["_settings_revision"])
+    except ValueError:
+        # Another writer's explicit setting/clear wins; do not retry the seed.
+        staff_record = state_store.get_staff_settings(WEB_MANAGER_ID)
+staff_record["dataset_mode"] = staff_record.get("_dataset_mode", "operational")
 if "staff_saved" not in st.session_state:
     st.session_state.staff_saved = {"staff": staff_record["staff"], "settings": staff_record["settings"], "dataset_mode": staff_record.get("dataset_mode", "operational")}
+    st.session_state.staff_saved_revision = staff_record.get("_settings_revision", 0)
+elif st.session_state.get("staff_saved_revision", 0) != staff_record.get("_settings_revision", 0):
+    # Canonical saved state must track other sessions/worker reads; an open form
+    # draft stays separate and is rejected on save if its base revision is stale.
+    prior_shared = shared_parameters_from_staff(st.session_state.staff_saved)
+    latest_shared = shared_parameters_from_staff(staff_record)
+    for key in SHARED_PARAMETER_KEYS:
+        widget_key = f"param_{key}"
+        if st.session_state.get(widget_key, prior_shared[key]) == prior_shared[key]:
+            st.session_state[widget_key] = latest_shared[key]
+    st.session_state.staff_saved = clean_payload(staff_record)
+    st.session_state.staff_saved_revision = staff_record.get("_settings_revision", 0)
+    if "parameters" in st.session_state:
+        st.session_state.parameters.update(latest_shared)
 if "staff_draft" not in st.session_state:
     st.session_state.staff_draft = clean_payload(st.session_state.staff_saved)
+    st.session_state.staff_editor_base_revision = st.session_state.staff_saved_revision
+# An already-open browser from an older app version has no trusted form base.
+# Preserve its draft, but require explicit reload before it can overwrite data.
+st.session_state.setdefault("staff_editor_base_revision", -1)
 if "scenarios" not in st.session_state: st.session_state.scenarios = persisted_state["scenarios"]
 if "approval" not in st.session_state: st.session_state.approval = persisted_state["approval"]
 if "pending" not in st.session_state: st.session_state.pending = persisted_state["pending"]
@@ -73,6 +118,7 @@ if "audit" not in st.session_state: st.session_state.audit = []
 if "chat" not in st.session_state: st.session_state.chat = []
 
 PARAMETER_DEFAULTS = {
+    "room_capacity": None,
     "checkout_rooms": 150, "stayover_rooms": 150, "checkout_minutes": 22, "stayover_minutes": 10, "inspection_minutes": 3,
     "paid_shift_hours": 8, "break_minutes": 60, "other_duties_minutes": 30,
     "late_release_minutes": 0, "attendant_adjustment": 0,
@@ -83,6 +129,11 @@ PARAMETER_DEFAULTS = {
 def workbook_parameters(settings):
     values = {}
     for key, fallback in PARAMETER_DEFAULTS.items():
+        if key == "room_capacity":
+            # There is no hotel inventory in this workbook's Settings table.
+            # Its daily room-service rows must not become an inferred capacity.
+            values[key] = None
+            continue
         value = settings.get(key, fallback)
         values[key] = float(value) if key in {"paid_shift_hours", "budget_usd"} else int(float(value))
     return values
@@ -108,16 +159,24 @@ def apply_parameter_values(values):
         st.session_state.scenarios["budget_usd"] = None
     st.session_state.parameters = values
     if previous != values:
-        # Share cleaning standards with the weekly planner; never alter room counts.
-        cleaning = {key: values[key] for key in ("checkout_minutes", "stayover_minutes")}
-        saved_cleaning = st.session_state.staff_saved["settings"]["cleaning_standards"]
-        if any(saved_cleaning[key] != value for key, value in cleaning.items()):
-            saved_cleaning.update(cleaning)
-            st.session_state.staff_draft["settings"]["cleaning_standards"].update(cleaning)
+        shared = {key: values[key] for key in SHARED_PARAMETER_KEYS}
+        previous_shared = shared_parameters_from_staff(st.session_state.staff_saved)
+        changes = {key: value for key, value in shared.items() if previous_shared[key] != value}
+        if changes:
+            # Atomic partial merge preserves any newer saved staff availability.
+            saved = state_store.save_hotel_parameters(WEB_MANAGER_ID, changes)
+            st.session_state.staff_saved = clean_payload(saved)
+            st.session_state.staff_saved_revision = saved["_settings_revision"]
+            canonical_shared = shared_parameters_from_staff(saved)
+            st.session_state.parameters.update(canonical_shared)
+            if canonical_shared != shared:
+                # A concurrent writer changed a different shared field. Keep
+                # UI parameters paired with the atomic merge's latest snapshot,
+                # then refresh widgets before accepting another edit.
+                st.session_state.shared_parameter_widget_refresh = canonical_shared
+            st.session_state.staff_draft = clean_payload(saved)
+            st.session_state.staff_editor_base_revision = saved["_settings_revision"]
             st.session_state.staff_editor_version = st.session_state.get("staff_editor_version", 0) + 1
-            mode = st.session_state.staff_saved.get("dataset_mode", "operational")
-            state_store.save_staff_settings(WEB_MANAGER_ID, st.session_state.staff_saved,
-                                           DEMO_SEED_VERSION if mode == "demo" else 0, dataset_mode=mode)
         invalidate(st.session_state.approval, "Operating parameters changed")
         record_web_change("operating_parameters", previous, values, "Manager updated calculation parameters")
         persist_web_state(st.session_state.pending)
@@ -189,6 +248,7 @@ def metric_card(column, label, value, detail, icon):
 
 def reset_parameter_values():
     defaults = workbook_parameters(data.settings)
+    defaults["room_capacity"] = shared_parameters_from_staff(st.session_state.staff_saved)["room_capacity"]
     apply_parameter_values(defaults)
     for name, value in defaults.items():
         st.session_state[f"param_{name}"] = value
@@ -203,8 +263,7 @@ def load_state():
 data, validation, load_error = load_state()
 if data and "parameters" not in st.session_state:
     st.session_state.parameters = workbook_parameters(data.settings)
-    st.session_state.parameters.update({key: st.session_state.staff_saved["settings"]["cleaning_standards"][key]
-                                        for key in ("checkout_minutes", "stayover_minutes")})
+    st.session_state.parameters.update(shared_parameters_from_staff(st.session_state.staff_saved))
 with st.container(horizontal=True, horizontal_alignment="distribute", vertical_alignment="center"):
     st.markdown(":material/concierge: **HOTEL OPERATIONS**")
     with st.popover("Workspace", icon=":material/tune:"):
@@ -256,8 +315,9 @@ if "parameters" not in st.session_state:
 # Streamlit removes widget state when a page is not rendered. Rehydrate from
 # canonical parameters on entry, without overwriting edits during widget reruns.
 entering_parameters = nav == "PARAMETERS" and st.session_state.get("previous_navigation") != "PARAMETERS"
+shared_widget_refresh = st.session_state.pop("shared_parameter_widget_refresh", None)
 for name, value in st.session_state.parameters.items():
-    if entering_parameters:
+    if entering_parameters or (shared_widget_refresh and name in SHARED_PARAMETER_KEYS):
         st.session_state[f"param_{name}"] = value
     else:
         st.session_state.setdefault(f"param_{name}", value)
@@ -265,12 +325,15 @@ st.session_state.previous_navigation = nav
 
 if nav == "PARAMETERS":
     st.subheader("Shape your operating plan")
-    st.caption("Daily calculations update immediately. Checkout and stayover cleaning times also update the weekly planner: return to Weekly Forecast and select Regenerate weekly roster. Forecast room counts do not change. Other daily and inventory inputs remain separate from weekly Staff & Settings assumptions.")
+    st.caption("Hotel room inventory and checkout/stayover cleaning times save to the same hotel settings used by WhatsApp and the weekly planner. Other daily and purchasing inputs remain session-only. After shared settings change, regenerate an existing weekly roster; forecast room counts do not change.")
     hk_tab, inventory_tab = st.tabs(["Housekeeping & staffing", "Inventory & purchasing"])
     with hk_tab:
         a, b = st.columns(2)
         with a.container(border=True):
             st.markdown("#### Room service")
+            st.number_input("Total rooms", min_value=1, max_value=10000, value=None, step=1, key="param_room_capacity", help="Saved total hotel room inventory used to validate WhatsApp forecasts. This is not today's checkout plus stayover workload. The built-in fictional hotel starts at the user-confirmed 292 rooms; other hotels remain unknown until explicitly saved.")
+            if st.session_state.param_room_capacity is None:
+                st.info("Hotel inventory is not saved yet. Enter the known room capacity here before automatic WhatsApp processing; no value is inferred from daily service counts.")
             st.number_input("Checkout rooms today", min_value=0, max_value=10000, step=1, key="param_checkout_rooms", help="Number of checkout rooms included in the housekeeping plan."); st.number_input("Stayover rooms today", min_value=0, max_value=10000, step=1, key="param_stayover_rooms", help="Number of stayover rooms included in the housekeeping plan."); st.number_input("Checkout room cleaning (minutes)", min_value=1, max_value=240, step=1, key="param_checkout_minutes", help="Cleaning time used for each checkout room.")
             st.number_input("Stayover room cleaning (minutes)", min_value=1, max_value=180, step=1, key="param_stayover_minutes", help="Cleaning time used for each stayover room.")
             st.number_input("Final inspection buffer (minutes)", min_value=0, max_value=120, step=1, key="param_inspection_minutes", help="Added after the final checkout room is cleaned.")
@@ -297,6 +360,8 @@ if nav == "PARAMETERS":
         st.error("Breaks and other duties must leave productive time in the shift. Results below keep the last valid plan.")
     else:
         apply_parameter_values(updated_parameters)
+        if st.session_state.get("shared_parameter_widget_refresh"):
+            st.rerun()
 
 hk, li, timing = calculate_components(data, st.session_state.scenarios, st.session_state.parameters)
 
@@ -351,6 +416,7 @@ elif nav == "PARAMETERS":
     i2.metric("Recommended order", f"{li['recommended_bottles']:,.0f} bottles", f"estimated ${li['estimated_cost']:,.0f}")
     i3.metric("Budget remaining", f"${li['remaining_budget']:,.0f}", "over budget" if li["remaining_budget"] < 0 else "within budget")
     st.dataframe(li["items"][["product_name", "forecast_demand", "usable_stock", "incoming", "recommended_order", "estimated_cost"]], width="stretch", hide_index=True)
+    st.caption("Reset restores daily workbook assumptions and cleaning times; it keeps the separately confirmed hotel room inventory because the workbook has no inventory default.")
     st.button("Reset Parameters to Workbook Defaults", on_click=reset_parameter_values)
 elif nav == "AI Chat - My Copilot":
     st.subheader("AI Chat - My Copilot")
@@ -411,6 +477,8 @@ elif nav == "STAFF & SETTINGS":
     st.warning("PUBLIC DEMO ONLY · This app has no sign-in. Entries may be stored in the app's SQLite database and can be lost or shared depending on deployment configuration. Use fictional sample data only; never enter real employee identities, availability, time off, or hotel policy.")
     st.warning("DEMO ASSUMPTIONS · Fictional staff and editable examples. These values are not hotel policy.")
     st.caption("Saved staff and assumptions drive the weekly roster. Checkout and stayover cleaning times are shared with Parameters and AI Chat. After changes, select Regenerate weekly roster; the forecast room counts stay unchanged. Daily staffing still uses the separate workbook roster.")
+    if st.session_state.staff_editor_base_revision != st.session_state.staff_saved_revision:
+        st.warning("Saved hotel settings changed in another session while this draft was open. Your form edits are retained, but cannot overwrite newer settings. Select Cancel edits to reload before reapplying them.")
     current_mode = st.session_state.staff_saved.get("dataset_mode", "operational")
     if current_mode == "demo":
         st.info("Dataset state: **DEMO**. The reset action can replace this entire roster and its assumptions.")
@@ -476,18 +544,31 @@ elif nav == "STAFF & SETTINGS":
                 for error in errors: st.error(error)
             else:
                 cleaned = clean_payload(candidate)
-                state_store.save_staff_settings(WEB_MANAGER_ID, cleaned, DEMO_SEED_VERSION if cleaned["dataset_mode"] == "demo" else 0, dataset_mode=cleaned["dataset_mode"])
-                st.session_state.staff_saved = cleaned
-                st.session_state.staff_draft = clean_payload(cleaned)
-                cleaning = cleaned["settings"]["cleaning_standards"]
-                apply_parameter_values({**st.session_state.parameters, **{key: cleaning[key] for key in ("checkout_minutes", "stayover_minutes")}})
-                for key in ("checkout_minutes", "stayover_minutes"):
-                    st.session_state[f"param_{key}"] = cleaning[key]
-                st.session_state.staff_editor_version += 1
-                st.success("Staff and settings saved to persistent app storage.")
-                st.rerun()
+                try:
+                    state_store.save_staff_settings(WEB_MANAGER_ID, cleaned, DEMO_SEED_VERSION if cleaned["dataset_mode"] == "demo" else 0,
+                                                   dataset_mode=cleaned["dataset_mode"], expected_revision=st.session_state.staff_editor_base_revision)
+                except ValueError as exc:
+                    st.error(f"{exc} Your form was not saved. Select Cancel edits to reload the latest saved hotel settings, then reapply your changes.")
+                else:
+                    saved = state_store.get_staff_settings(WEB_MANAGER_ID)
+                    saved["dataset_mode"] = saved["_dataset_mode"]
+                    # Pair the payload and revision from the same read. Another
+                    # writer may have committed after our successful save.
+                    canonical = clean_payload(saved)
+                    st.session_state.staff_saved = canonical
+                    st.session_state.staff_saved_revision = saved["_settings_revision"]
+                    st.session_state.staff_editor_base_revision = saved["_settings_revision"]
+                    st.session_state.staff_draft = clean_payload(canonical)
+                    shared = shared_parameters_from_staff(canonical)
+                    apply_parameter_values({**st.session_state.parameters, **shared})
+                    for key, value in shared.items():
+                        st.session_state[f"param_{key}"] = value
+                    st.session_state.staff_editor_version += 1
+                    st.success("Staff and settings saved to persistent app storage.")
+                    st.rerun()
     if cancel_clicked:
         st.session_state.staff_draft = clean_payload(st.session_state.staff_saved)
+        st.session_state.staff_editor_base_revision = st.session_state.staff_saved_revision
         st.session_state.staff_editor_version += 1
         st.info("Unsaved edits were discarded.")
         st.rerun()
@@ -501,13 +582,22 @@ elif nav == "STAFF & SETTINGS":
         reset_confirmed = st.checkbox("I understand reset restores the fictional demo roster and demo assumptions.", key=f"confirm_staff_demo_reset_{st.session_state.staff_editor_version}")
         if st.button("Reset demo staff & settings", disabled=not reset_confirmed, type="secondary"):
             defaults = demo_defaults()
-            state_store.save_staff_settings(WEB_MANAGER_ID, defaults, DEMO_SEED_VERSION, dataset_mode="demo")
-            st.session_state.staff_saved = defaults
-            st.session_state.staff_draft = clean_payload(defaults)
-            cleaning = defaults["settings"]["cleaning_standards"]
-            apply_parameter_values({**st.session_state.parameters, **{key: cleaning[key] for key in ("checkout_minutes", "stayover_minutes")}})
-            for key in ("checkout_minutes", "stayover_minutes"):
-                st.session_state[f"param_{key}"] = cleaning[key]
+            try:
+                state_store.save_staff_settings(WEB_MANAGER_ID, defaults, DEMO_SEED_VERSION, dataset_mode="demo", expected_revision=stored.get("_settings_revision"))
+            except ValueError as exc:
+                st.error(f"{exc} No reset was applied; reload and review the current settings.")
+                st.stop()
+            saved = state_store.get_staff_settings(WEB_MANAGER_ID)
+            saved["dataset_mode"] = saved["_dataset_mode"]
+            canonical = clean_payload(saved)
+            st.session_state.staff_saved = canonical
+            st.session_state.staff_saved_revision = saved["_settings_revision"]
+            st.session_state.staff_editor_base_revision = saved["_settings_revision"]
+            st.session_state.staff_draft = clean_payload(canonical)
+            shared = shared_parameters_from_staff(canonical)
+            apply_parameter_values({**st.session_state.parameters, **shared})
+            for key, value in shared.items():
+                st.session_state[f"param_{key}"] = value
             st.session_state.staff_editor_version += 1
             st.success("The demo roster and assumptions were reset.")
             st.rerun()
@@ -527,6 +617,39 @@ elif nav == "WEEKLY FORECAST":
     if "weekly_candidate_is_draft" not in st.session_state: st.session_state.weekly_candidate_is_draft = False
     if "forecast_ai_result" not in st.session_state: st.session_state.forecast_ai_result = None
     if "forecast_ai_disagreement_ack" not in st.session_state: st.session_state.forecast_ai_disagreement_ack = False
+
+    # A development-only view, not an authentication mechanism. The public
+    # no-sign-in demo must never enumerate an enrolled manager's private inbox.
+    inbox_allowed = (
+        os.getenv("WHATSAPP_DEV_INBOX_ENABLED", "").strip() == "1"
+        and is_loopback_address(getattr(st.context, "ip_address", None))
+        and bool(os.getenv("WEB_MANAGER_ID", "").strip())
+        and staff_record.get("_dataset_mode", staff_record.get("dataset_mode")) == "demo"
+        and st.session_state.staff_saved.get("dataset_mode") == "demo"
+    )
+    if inbox_allowed:
+        with st.expander("WhatsApp forecast inbox (local demo)", expanded=False):
+            st.caption("Synthetic local records only. Production requires authenticated hotel access and durable private storage. Loading is explicit and never replaces an open draft.")
+            inbox_versions = [item for item in state_store.list_weekly_roster_versions(WEB_MANAGER_ID)
+                              if isinstance(item.get("source"), dict)
+                              and item["source"].get("channel") == "whatsapp"
+                              and item["source"].get("dataset_mode") == "demo"][:10]
+            if not inbox_versions:
+                st.info("No saved WhatsApp forecast versions for this demo manager yet.")
+            open_forecast = bool(st.session_state.forecast_confirmed or st.session_state.weekly_candidate
+                                 or st.session_state.forecast_review_rows)
+            if open_forecast:
+                st.caption("To load another saved version, open Extracted forecast data and select Cancel / clear upload and review first. Your current work is unchanged.")
+            for item in inbox_versions:
+                status = "Covered under saved assumptions" if item.get("feasible") else "NEEDS ATTENTION - uncovered demand or constraints"
+                st.text(f"{item['week_start']} to {item.get('week_end', '')} | Version {item['version']} | {status}")
+                if st.button(f"Load WhatsApp roster {item['week_start']} v{item['version']}",
+                             key=f"whatsapp_load_{item['week_start']}_{item['version']}", disabled=open_forecast):
+                    st.session_state.forecast_confirmed = deepcopy(item["forecast"])
+                    st.session_state.weekly_candidate = deepcopy(item)
+                    st.session_state.weekly_candidate_is_draft = False
+                    st.session_state.weekly_candidate_version = st.session_state.get("weekly_candidate_version", 0) + 1
+                    st.rerun()
 
     weekly_view = st.radio(
         "Weekly Forecast", ["Weekly roster", "Extracted forecast data"],

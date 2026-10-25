@@ -1,0 +1,12 @@
+# Narrow native-PDF pilot dependencies, pinned to locally tested Python 3.12 versions.
+# No Streamlit, pytest, LLM, OCR engine or PyMuPDF in the runtime image.
+# Transitive dependencies and base image still need a verified image-build audit.
+fastapi==0.162.0
+uvicorn==0.54.0
+httpx==0.28.1
+pandas==3.1.0
+openpyxl==3.1.5
+pypdf==6.21.2
+Pillow==13.0.0
+reportlab==5.1.0
+twilio==9.12.0
