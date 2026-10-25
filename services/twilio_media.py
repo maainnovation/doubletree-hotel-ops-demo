@@ -60,8 +60,12 @@ class TwilioMediaPublisher:
 
     def _context(self, db, outbox_id, now, *, publishing=False):
         """Resolve current identity and saved-result state within the caller's lock."""
-        item = db.execute("SELECT * FROM wa_outbox WHERE id=?", (outbox_id,)).fetchone()
         allowed = {"sending"} if publishing else {"sending", "accepted", "sent", "delivered", "read", "reconciliation_required"}
+        return self._bound_context(db, outbox_id, now, allowed)
+
+    def _bound_context(self, db, outbox_id, now, allowed):
+        """Internal identity/result validation; callers supply explicit states."""
+        item = db.execute("SELECT * FROM wa_outbox WHERE id=?", (outbox_id,)).fetchone()
         if not item or item["kind"] != "document" or item["status"] not in allowed:
             self._deny()
         origin = db.execute("SELECT * FROM wa_jobs WHERE id=?", (item["job_id"],)).fetchone()

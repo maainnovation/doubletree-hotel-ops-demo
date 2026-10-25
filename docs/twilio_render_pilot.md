@@ -203,3 +203,31 @@ response/body limits and rejection/retry semantics are unchanged. This revision
 does not schedule a retry: any operator retry requires separate approval, an
 audited compare-and-set of the already-saved outbox and the original durable
 three-attempt cap. There is no fourth attempt or automatic trial upgrade.
+
+## Optional, operator-approved download probe
+
+The isolated pilot supports an explicitly created, **one-download / ten-minute**
+capability to its already-generated fictional PDF for HTTPS troubleshooting.
+This is disabled by default (no diagnostic grant); there is no public mint or
+admin endpoint. Only the in-process operator method can create a probe, and only
+for the exact terminal failed synthetic document with the unchanged exhausted
+three-attempt budget. It does not requeue a message, change delivery state, make
+a provider call or reset any limit.
+
+Probe grants occupy a separate `pilot_media_probes` table and store only token
+hashes. The normal `/media/twilio/{token}/{filename}` GET/HEAD route and its PDF
+response/header code are reused. Every access revalidates the saved roster,
+enrollment, current settings, file hash, approval and customer-service window.
+HEAD does not consume the single GET. Expiry is the earliest of ten minutes,
+pilot approval expiry and the service window. Successful GET or explicit
+revocation makes the link unavailable; the non-secret audit row remains, and
+this outbox cannot silently mint another probe. Ordinary delivery grants retain
+their original status checks and limits.
+
+An authorized operator must keep the capability only in memory, use HTTPS with
+redirects disabled, compare the downloaded bytes to the private saved PDF,
+explicitly revoke in a `finally` block and verify a subsequent HEAD is 404.
+Print only safe status/header checks and hash-equality results, never the URL,
+raw response body or credentials. A request from the Render shell through the
+public hostname verifies that public HTTPS edge path, but is **not** a test from
+an independent network or proof that Twilio itself can download it.

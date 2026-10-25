@@ -27,6 +27,7 @@ from reportlab.lib.pagesizes import landscape, letter
 from services.hotel_parameters import apply_shared_parameters
 from services.staff_settings import demo_defaults
 from services.twilio_media import TwilioMediaPublisher
+from services.twilio_probe import PilotDiagnosticMediaPublisher
 from services.twilio_provider import TwilioWhatsAppProvider, twilio_business_id, ProviderResourceNotFound
 from services.whatsapp_provider import ProviderError
 from services.whatsapp_store import PrivateFileStore, WorkflowStore
@@ -323,7 +324,7 @@ def build_runtime(config: PilotConfig, *, transport=None, clock=time.time):
                 db.executescript('CREATE TABLE pilot_identity(id INTEGER PRIMARY KEY,identity TEXT NOT NULL); CREATE TABLE pilot_send_attempts(outbox_id TEXT NOT NULL,attempt INTEGER NOT NULL,PRIMARY KEY(outbox_id,attempt)); CREATE TABLE pilot_heartbeat(id INTEGER PRIMARY KEY,updated_at REAL NOT NULL);')
                 db.execute('INSERT INTO pilot_identity(id,identity) VALUES(1,?)',(identity,))
         files=PrivateFileStore(root/'private')
-    publisher=TwilioMediaPublisher(store,files,config.origin,clock=clock)
+    publisher=PilotDiagnosticMediaPublisher(store,files,config.origin,approved_until=config.approved_until,clock=clock)
     actual=TwilioWhatsAppProvider(config.account_sid,config.auth_token,config.business_sender,media_publisher=publisher,
                                  status_callback_url=config.callback_url,production_approved=not mocked,transport=transport)
     provider=SyntheticPilotProvider(actual,store,files,config,fixture,clock=clock)
