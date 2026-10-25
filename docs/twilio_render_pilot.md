@@ -176,3 +176,19 @@ revision: **677 passed, 2 unchanged baseline OCR failures**, 2 warnings (198.24s
 Independent scoped security review passed, including receipt/anchor atomicity
 and claim-safe retries. A read-only live media preflight confirmed the original
 synthetic fixture's exact 1,677 bytes and SHA; outbound delivery is not implied.
+
+## Redacted rejection diagnostics
+
+The authorized recovery generated and saved the synthetic roster/PDF, but the
+first outbound REST submission was rejected without a Message SID. The original
+error handling intentionally retained only `provider_rejected`; no response body
+can be recovered from that record. The Console Debugger upgrade gate is respected;
+alternate APIs must not be used to bypass it, and no upgrade is performed.
+
+Subsequent explicitly authorized attempts retain only a validated numeric HTTP
+status and optional numeric Twilio code, for example `twilio_http_403_code_21608`
+(illustrative, not the observed error). Provider text, request/response bodies,
+headers, URLs and credentials are never stored in this diagnostic. Bounded
+malformed/truncated diagnostic bodies retain only the confirmed rejection status.
+This does not automatically retry rejected messages or change the existing
+ambiguous-send, rate-limit, service-window or persistent attempt-budget rules.

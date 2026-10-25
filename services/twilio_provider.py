@@ -34,6 +34,20 @@ class ProviderResourceNotFound(ProviderError):
     """Authenticated read returned 404; not an identity/time validation failure."""
 
 
+class TwilioRequestRejected(ProviderError):
+    """Confirmed rejection: retain only bounded numeric diagnostics, never body."""
+    def __init__(self, http_status: int, twilio_error_code: int | None = None):
+        if type(http_status) is not int or not 300 <= http_status < 500 or http_status in {408,429}:
+            raise ValueError("Not a confirmed Twilio rejection status")
+        self.http_status=http_status
+        self.twilio_error_code=(twilio_error_code if type(twilio_error_code) is int
+                               and 0 <= twilio_error_code <= 999999 else None)
+        self.safe_error_code=f"twilio_http_{http_status}"
+        if self.twilio_error_code is not None:
+            self.safe_error_code+=f"_code_{self.twilio_error_code}"
+        super().__init__(self.safe_error_code)
+
+
 class MediaPublisher(Protocol):
     """Issue a bounded-lifetime URL for this outbox PDF, never a public listing."""
     def publish(self, pdf_bytes: bytes, filename: str, idempotency_key: str) -> str: ...
@@ -207,6 +221,18 @@ class TwilioWhatsAppProvider:
                 if not sending and response.status_code == 404:
                     raise ProviderResourceNotFound("Provider resource was not found.")
                 if not 200 <= response.status_code < 300:
+                    if sending and 300 <= response.status_code < 500:
+                        # A confirmed rejection is not an uncertain send. Read
+                        # only a bounded numeric code; never retain provider text,
+                        # body, headers, URLs or credentials in errors/state/logs.
+                        error_code=None
+                        try:
+                            rejected=json.loads(self._read(response,_JSON_LIMIT))
+                            if isinstance(rejected,dict):
+                                error_code=rejected.get("code")
+                        except (ValueError,RecursionError,ProviderError,httpx.RequestError):
+                            pass
+                        raise TwilioRequestRejected(response.status_code,error_code) from None
                     raise ProviderError("Provider rejected or redirected the request.")
                 try:
                     result = json.loads(self._read(response, _JSON_LIMIT))

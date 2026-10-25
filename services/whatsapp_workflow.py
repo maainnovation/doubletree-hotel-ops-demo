@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 
 from services.whatsapp_forecast import ForecastNeedsCorrection, validate_whatsapp_forecast
 from services.whatsapp_provider import AmbiguousSendError, ProviderError, RetryableProviderError
+from services.twilio_provider import TwilioRequestRejected
 from services.weekly_roster import build_exports, generate_weekly_roster, is_roster_current
 from services.hotel_parameters import saved_room_capacity
 
@@ -246,6 +247,8 @@ class ForecastWorker:
             code, message_id = "safe_presend_retry", None
         except AmbiguousSendError:
             status, code, message_id = "reconciliation_required", "send_outcome_unknown", None
+        except TwilioRequestRejected as exc:
+            status, code, message_id = "failed", exc.safe_error_code, None
         except ProviderError:
             status, code, message_id = "failed", "provider_rejected", None
         except Exception:
