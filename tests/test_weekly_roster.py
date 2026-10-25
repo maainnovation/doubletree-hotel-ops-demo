@@ -55,6 +55,14 @@ def test_parameter_change_requires_regenerate_and_summary_is_collapsed(tmp_path,
     assert not any(button.label == "Save reviewed roster version" for button in app.button)
     assert not app.get("download_button")
     assert not any(item.label == "Day-by-day calculation summary" for item in app.expander)
+    # Re-entering the Parameters page must not revive its old widget defaults.
+    for _ in range(2):
+        app.segmented_control[0].set_value("PARAMETERS").run(timeout=40)
+        assert app.number_input(key="param_checkout_minutes").value == 25
+        assert app.session_state["parameters"]["checkout_minutes"] == 25
+        assert app.session_state["staff_saved"]["settings"]["cleaning_standards"]["checkout_minutes"] == 25
+        app.segmented_control[0].set_value("WEEKLY FORECAST").run(timeout=40)
+        assert any("ROSTER OUT OF DATE" in item.value for item in app.warning)
     next(button for button in app.button if button.label == "Regenerate weekly roster").click().run(timeout=40)
     updated = deepcopy(app.session_state["weekly_candidate"])
     assert updated["forecast"] == original["forecast"]

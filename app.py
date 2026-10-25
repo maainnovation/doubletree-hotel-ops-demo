@@ -245,7 +245,7 @@ if load_error or (validation and not validation.is_valid):
 HIDDEN_NAVIGATION = {"TODAY", "OPERATIONS"}
 navigation_options = [page for page in ["WEEKLY FORECAST", "TODAY", "PARAMETERS", "STAFF & SETTINGS", "AI Chat - My Copilot", "OPERATIONS"]
                       if page not in HIDDEN_NAVIGATION]
-if st.session_state.get("navigation") not in navigation_options:
+if "navigation" in st.session_state and st.session_state.navigation not in navigation_options:
     st.session_state.navigation = "WEEKLY FORECAST"
 nav = st.segmented_control("Navigation", navigation_options,
     format_func=lambda label: {"WEEKLY FORECAST": ":material/calendar_month: Weekly Forecast", "TODAY": ":material/dashboard: Today", "PARAMETERS": ":material/tune: Parameters", "STAFF & SETTINGS": ":material/groups: Staff & Settings", "OPERATIONS": ":material/room_service: Operations"}.get(label, label),
@@ -253,8 +253,15 @@ nav = st.segmented_control("Navigation", navigation_options,
 
 if "parameters" not in st.session_state:
     st.session_state.parameters = workbook_parameters(data.settings)
+# Streamlit removes widget state when a page is not rendered. Rehydrate from
+# canonical parameters on entry, without overwriting edits during widget reruns.
+entering_parameters = nav == "PARAMETERS" and st.session_state.get("previous_navigation") != "PARAMETERS"
 for name, value in st.session_state.parameters.items():
-    st.session_state.setdefault(f"param_{name}", value)
+    if entering_parameters:
+        st.session_state[f"param_{name}"] = value
+    else:
+        st.session_state.setdefault(f"param_{name}", value)
+st.session_state.previous_navigation = nav
 
 if nav == "PARAMETERS":
     st.subheader("Shape your operating plan")
