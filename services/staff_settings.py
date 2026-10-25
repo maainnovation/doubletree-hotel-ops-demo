@@ -17,10 +17,25 @@ def demo_defaults():
     }
     prefixes = {"Housekeeper": "DEMO-HK", "Houseman": "DEMO-HM", "Lobby Staff": "DEMO-LB", "Manager": "DEMO-MG"}
     skills = {"Housekeeper": "checkout cleaning; stayover service", "Houseman": "houseperson; linen; public areas", "Lobby Staff": "lobby; public areas", "Manager": "supervision; inspection"}
+    # Rotate two rest days per person. This leaves usable daily role coverage across the
+    # requested Fri–Thu demo week while keeping every recurring employee at 40 paid hours.
+    hk_rest = [("Thu", "Mon"), ("Thu", "Tue"), ("Wed", "Fri"), ("Wed", "Sun"),
+               ("Mon", "Tue"), ("Mon", "Thu"), ("Fri", "Sat"), ("Fri", "Sun"),
+               ("Tue", "Wed"), ("Tue", "Thu"), ("Sat", "Sun"), ("Sat", "Mon"),
+               ("Wed", "Thu"), ("Wed", "Fri"), ("Sun", "Mon"), ("Tue", "Thu")]
+    rest_days = {
+        "Housekeeper": hk_rest,
+        "Houseman": [("Sat", "Sun"), ("Mon", "Tue"), ("Wed", "Thu"), ("Fri", "Sun")],
+        "Lobby Staff": [("Fri", "Sat"), ("Tue", "Wed")],
+        "Manager": [("Fri", "Sat"), ("Tue", "Wed")],
+    }
+    day_order = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
     staff = []
     for role, people in names.items():
         for i, person in enumerate(people, 1):
-            staff.append({"staff_id": f"{prefixes[role]}-{i:02d}", "display_name": person, "role": role, "status": "Active", "skills": skills[role], "availability_json": json.dumps({"Mon":"09:00-17:00", "Tue":"09:00-17:00", "Wed":"09:00-17:00", "Thu":"09:00-17:00", "Fri":"09:00-17:00", "Sat":"OFF", "Sun":"OFF"}), "requested_time_off": "", "shift_pattern": "Demo day shift (09:00-17:00)", "max_weekly_hours": 40, "max_daily_hours": 8, "hourly_cost": 25.0})
+            rest = set(rest_days[role][i - 1])
+            availability = {day: ("OFF" if day in rest else "09:00-17:00") for day in day_order}
+            staff.append({"staff_id": f"{prefixes[role]}-{i:02d}", "display_name": person, "role": role, "status": "Active", "skills": skills[role], "availability_json": json.dumps(availability), "requested_time_off": "", "shift_pattern": "Demo day shift (09:00-17:00)", "max_weekly_hours": 40, "max_daily_hours": 8, "hourly_cost": 25.0})
     settings = {
         "demo_assumptions": True,
         "cleaning_standards": {"checkout_minutes": 22, "stayover_minutes": 10, "stayover_service_policy": "Service all stayovers (editable demo assumption)", "inspection_minutes": 3},

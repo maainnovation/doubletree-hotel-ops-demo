@@ -21,6 +21,17 @@ from copilot.scenarios import initial_scenarios
 from services.staff_settings import demo_defaults, validate_staff_settings, clean_payload, DEMO_SEED_VERSION
 import json
 import pandas as pd
+import hashlib
+from datetime import date, timedelta
+from services.forecast_import import (FORECAST_FIELDS, NUMERIC_FIELDS, REVIEW_FIELDS, REVIEW_LABELS,
+                                      empty_forecast, extract_forecast_upload,
+                                      forecast_rows_to_review_matrix, review_matrix_to_forecast_rows,
+                                      normalize_forecast_rows, validate_forecast,
+                                      extraction_requires_review_before_generation)
+from services.weekly_roster import generate_weekly_roster, schedule_changes, build_exports, weekly_grid
+from services.forecast_ai import (ai_vision_available, compare_forecast_extractions,
+                                  comparison_to_review_matrix, extract_forecast_with_ai,
+                                  fill_missing_from_ai, is_loopback_address)
 
 ROOT = Path(__file__).parent
 load_dotenv(ROOT / ".env")
@@ -149,6 +160,10 @@ def go_to(page):
     st.session_state.navigation = page
 
 
+def set_weekly_forecast_view(view):
+    st.session_state.weekly_forecast_view = view
+
+
 def queue_question(question):
     st.session_state.navigation = "AI Chat - My Copilot"
     st.session_state.queued_question = question
@@ -212,9 +227,9 @@ if load_error or (validation and not validation.is_valid):
     st.info("Add or fix the workbook, then select Sync Hotel Data.")
     st.stop()
 
-nav = st.segmented_control("Navigation", ["TODAY", "PARAMETERS", "STAFF & SETTINGS", "AI Chat - My Copilot", "OPERATIONS"],
-    format_func=lambda label: {"TODAY": ":material/dashboard: Today", "PARAMETERS": ":material/tune: Parameters", "STAFF & SETTINGS": ":material/groups: Staff & Settings", "OPERATIONS": ":material/room_service: Operations"}.get(label, label),
-    default="TODAY", label_visibility="collapsed", key="navigation", width="stretch")
+nav = st.segmented_control("Navigation", ["WEEKLY FORECAST", "TODAY", "PARAMETERS", "STAFF & SETTINGS", "AI Chat - My Copilot", "OPERATIONS"],
+    format_func=lambda label: {"WEEKLY FORECAST": ":material/calendar_month: Weekly Forecast", "TODAY": ":material/dashboard: Today", "PARAMETERS": ":material/tune: Parameters", "STAFF & SETTINGS": ":material/groups: Staff & Settings", "OPERATIONS": ":material/room_service: Operations"}.get(label, label),
+    default="WEEKLY FORECAST", label_visibility="collapsed", key="navigation", width="stretch")
 
 if "parameters" not in st.session_state:
     st.session_state.parameters = workbook_parameters(data.settings)
@@ -461,6 +476,325 @@ elif nav == "STAFF & SETTINGS":
             st.session_state.staff_editor_version += 1
             st.success("The demo roster and assumptions were reset.")
             st.rerun()
+elif nav == "WEEKLY FORECAST":
+    st.subheader("Weekly Forecast")
+    st.warning("PUBLIC DEMO ONLY · No sign-in is configured. Use fictional or non-sensitive forecast examples only. Files are processed locally by default. Optional AI vision is restricted to an explicitly allowlisted private manager and sends the selected pages to OpenAI; API charges may apply.")
+    st.warning("DEMO ASSUMPTIONS · Staff and operating rules come from the separate Staff & Settings page. They are editable assumptions, not hotel-confirmed policy.")
+    st.caption("Upload a forecast image/PDF to extract its values and draft a Friday–Thursday employee shift roster. Review unclear data before generation, then confirm the forecast before saving a roster. This is not a room-level assignment plan.")
+
+    if "forecast_upload_version" not in st.session_state: st.session_state.forecast_upload_version = 0
+    if "forecast_upload_hash" not in st.session_state: st.session_state.forecast_upload_hash = None
+    if "forecast_review_rows" not in st.session_state: st.session_state.forecast_review_rows = None
+    if "forecast_review_notices" not in st.session_state: st.session_state.forecast_review_notices = []
+    if "forecast_extraction_method" not in st.session_state: st.session_state.forecast_extraction_method = None
+    if "forecast_confirmed" not in st.session_state: st.session_state.forecast_confirmed = None
+    if "weekly_candidate" not in st.session_state: st.session_state.weekly_candidate = None
+    if "weekly_candidate_is_draft" not in st.session_state: st.session_state.weekly_candidate_is_draft = False
+    if "forecast_ai_result" not in st.session_state: st.session_state.forecast_ai_result = None
+    if "forecast_ai_disagreement_ack" not in st.session_state: st.session_state.forecast_ai_disagreement_ack = False
+
+    weekly_view = st.radio(
+        "Weekly Forecast", ["Weekly roster", "Extracted forecast data"],
+        horizontal=True, key="weekly_forecast_view", label_visibility="collapsed",
+    )
+    st.markdown("#### Upload a forecast file")
+    uploaded = st.file_uploader("Forecast file (PDF or image)", type=["pdf", "png", "jpg", "jpeg", "tif", "tiff", "webp"], key=f"forecast_upload_{st.session_state.forecast_upload_version}", help="Native text PDF extraction runs locally. Scanned PDFs and images use local Tesseract OCR when installed. All extracted values require review.")
+    if uploaded:
+        contents = uploaded.getvalue()
+        digest = hashlib.sha256(contents).hexdigest()
+        if digest != st.session_state.forecast_upload_hash:
+            st.session_state.forecast_upload_hash = digest
+            st.session_state.forecast_confirmed = None
+            st.session_state.weekly_candidate = None
+            st.session_state.weekly_candidate_is_draft = False
+            st.session_state.forecast_ai_result = None
+            st.session_state.forecast_ai_disagreement_ack = False
+            try:
+                extracted = extract_forecast_upload(uploaded.name, contents)
+                st.session_state.forecast_review_rows = extracted["rows"]
+                st.session_state.forecast_review_notices = [f"Extraction method: {extracted['method']}", *extracted["notices"]]
+                st.session_state.forecast_extraction_method = extracted["method"]
+            except ValueError as exc:
+                st.session_state.forecast_review_rows = None
+                st.session_state.forecast_review_notices = [str(exc)]
+                st.session_state.forecast_extraction_method = None
+    request_ip = getattr(st.context, "ip_address", None)
+    ai_enabled = ai_vision_available(WEB_MANAGER_ID, is_localhost=is_loopback_address(request_ip))
+    if ai_enabled and uploaded:
+        st.info("Private AI vision is available for this manager only. It processes the selected forecast with OpenAI after your per-upload consent; API charges may apply. Results are candidates and must be reviewed.")
+        ai_opt_in = st.checkbox("I authorize sending this forecast to OpenAI for one structured extraction request.", key=f"forecast_ai_optin_{st.session_state.forecast_upload_version}")
+        if st.button("Compare with AI vision", key=f"forecast_ai_run_{st.session_state.forecast_upload_version}", disabled=not ai_opt_in):
+            with st.spinner("Extracting visible forecast cells for comparison…"):
+                try:
+                    st.session_state.forecast_ai_result = extract_forecast_with_ai(uploaded.name, contents)
+                    st.session_state.forecast_ai_disagreement_ack = False
+                except ValueError as exc:
+                    st.session_state.forecast_ai_result = None
+                    st.error(str(exc))
+                else:
+                    st.success("AI candidates received. Compare every field and correct the review table before confirming.")
+                    usage = st.session_state.forecast_ai_result.get("usage", {})
+                    if usage:
+                        st.caption(f"Model: {st.session_state.forecast_ai_result['model']} · Usage tokens: {usage.get('input_tokens', '?')} input / {usage.get('output_tokens', '?')} output")
+                    if st.session_state.forecast_review_rows is None:
+                        st.session_state.forecast_review_rows = [{"date": None, **{field: None for field in NUMERIC_FIELDS}, "prior_day_occupancy": None} for _ in range(7)]
+                        st.session_state.forecast_review_notices = ["Local extraction was unavailable or unreadable. AI candidates are shown for manual verification; dates are not guessed."]
+            st.rerun()
+    elif uploaded and os.getenv("FORECAST_AI_PRIVATE_ENABLED", "").strip() == "1":
+        st.caption("AI vision is not enabled for this public or non-allowlisted session. Use local extraction or manual entry.")
+    if weekly_view == "Extracted forecast data":
+        if st.button("Back to Weekly Forecast", key="back_to_weekly_forecast", on_click=set_weekly_forecast_view, args=("Weekly roster",)):
+            pass
+        ai_comparison = compare_forecast_extractions(st.session_state.forecast_review_rows, st.session_state.forecast_ai_result)
+        if ai_comparison:
+            st.markdown("#### Extraction comparison · AI is not authoritative")
+            st.caption("Dates are rows and forecast metrics are columns. Conflicts and uncertain cells must be resolved in the editable review below. AI candidates never replace a populated local value automatically.")
+            for issue in st.session_state.forecast_ai_result.get("validation_errors", []):
+                st.warning(f"AI candidate validation: {issue}")
+            comparison_matrix = pd.DataFrame(comparison_to_review_matrix(ai_comparison))
+            comparison_config = {"_day_slot": None, "date": st.column_config.TextColumn("Date", pinned=True, width=145)}
+            comparison_config.update({field: st.column_config.TextColumn(REVIEW_LABELS[field], width="small") for field in REVIEW_FIELDS})
+            st.caption("Compact cells show status · local value / AI candidate. Full evidence and confidence remain available below.")
+            st.dataframe(comparison_matrix, column_config=comparison_config, hide_index=True, width="stretch", height=300, alt="Field-by-field AI and local extraction comparison with dates as rows and metrics as columns")
+            with st.expander("Detailed extraction evidence by metric and date"):
+                st.dataframe(pd.DataFrame(ai_comparison), hide_index=True, width="stretch", alt="Detailed local and AI values, evidence, and confidence")
+            disagreement = any(item["status"] not in {"AGREE"} for item in ai_comparison)
+            if st.button("Fill blank cells from AI candidates only", key=f"fill_ai_missing_{st.session_state.forecast_upload_version}"):
+                st.session_state.forecast_review_rows = fill_missing_from_ai(st.session_state.forecast_review_rows, st.session_state.forecast_ai_result["rows"])
+                st.session_state.forecast_confirmed = None
+                st.session_state.forecast_ai_disagreement_ack = False
+                st.session_state.weekly_candidate = None
+                st.session_state.weekly_candidate_is_draft = False
+                st.rerun()
+            if disagreement:
+                st.session_state.forecast_ai_disagreement_ack = st.checkbox("I reviewed the local/AI differences and will verify and correct every field below before confirming.", key=f"ack_ai_diff_{st.session_state.forecast_upload_version}")
+        first_row = st.session_state.forecast_review_rows[0] if st.session_state.forecast_review_rows else None
+        default_friday = first_row["date"] if first_row and isinstance(first_row.get("date"), date) else date.today() - timedelta(days=(date.today().weekday() - 4) % 7)
+        start_date = st.date_input("Manual forecast week starts (Friday)", value=default_friday, key="forecast_manual_start")
+        manual_col, clear_col = st.columns(2)
+        if manual_col.button("Enter forecast manually", key="start_manual_forecast"):
+            st.session_state.forecast_review_rows = empty_forecast(start_date)
+            st.session_state.forecast_review_notices = ["Manual entry selected. No forecast counts have been prefilled."]
+            st.session_state.forecast_extraction_method = "Manual entry"
+            st.session_state.forecast_ai_result = None
+            st.session_state.forecast_ai_disagreement_ack = False
+            st.session_state.forecast_confirmed = None
+            st.session_state.weekly_candidate = None
+            st.session_state.weekly_candidate_is_draft = False
+            st.rerun()
+        if clear_col.button("Cancel / clear upload and review", key="clear_forecast_review"):
+            st.session_state.forecast_review_rows = None
+            st.session_state.forecast_review_notices = []
+            st.session_state.forecast_extraction_method = None
+            st.session_state.forecast_upload_hash = None
+            st.session_state.forecast_ai_result = None
+            st.session_state.forecast_ai_disagreement_ack = False
+            st.session_state.forecast_upload_version += 1
+            st.session_state.forecast_confirmed = None
+            st.session_state.weekly_candidate = None
+            st.session_state.weekly_candidate_is_draft = False
+            st.rerun()
+
+        if st.session_state.forecast_review_notices:
+            for notice in st.session_state.forecast_review_notices:
+                if "unavailable" in notice.lower() or "needs" in notice.lower() or "install" in notice.lower(): st.error(notice)
+                else: st.info(notice)
+        if st.session_state.forecast_review_rows is not None:
+            st.markdown("#### Review and correct the extracted values")
+            st.caption("Dates are rows and forecast metrics are columns. Correct the raw date and values on the same row. Required totals: arrivals + stayovers = rooms on books; rooms on books + forecast pickup = forecast occupied. Occupancy percent is retained as source data; no room inventory is inferred.")
+            with st.form("forecast_review_form"):
+                # Declare the schema explicitly so even an empty/partially
+                # populated review draft retains its date column for editing.
+                forecast_frame = pd.DataFrame(
+                    forecast_rows_to_review_matrix(st.session_state.forecast_review_rows),
+                    columns=["_day_slot", "date", *REVIEW_FIELDS],
+                )
+                forecast_frame["date"] = pd.to_datetime(forecast_frame["date"], errors="coerce").dt.date
+                for field in REVIEW_FIELDS:
+                    forecast_frame[field] = pd.to_numeric(forecast_frame[field], errors="coerce").astype(float)
+                column_config = {
+                    "_day_slot": None,
+                    "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", width=120),
+                }
+                column_config.update({field: st.column_config.NumberColumn(
+                    REVIEW_LABELS[field], min_value=0, step=0.1, format="%g", width="small",
+                ) for field in REVIEW_FIELDS})
+                edited_forecast = st.data_editor(
+                    forecast_frame, key=f"forecast_review_table_{st.session_state.forecast_upload_version}",
+                    hide_index=True, width="stretch", num_rows="fixed", column_config=column_config,
+                    disabled=["_day_slot"], alt="Editable forecast review with dates as rows and metrics as columns",
+                )
+                st.caption("Occupancy values are percentage points: 49 means 49%, not 0.49. An empty cell stays missing; zero is a distinct value.")
+                confirm_forecast = st.form_submit_button("Validate and confirm forecast", type="primary", disabled=bool(ai_comparison and any(item["status"] != "AGREE" for item in ai_comparison) and not st.session_state.forecast_ai_disagreement_ack))
+            if confirm_forecast:
+                candidate = review_matrix_to_forecast_rows(edited_forecast.to_dict(orient="records"), original_rows=st.session_state.forecast_review_rows)
+                st.session_state.forecast_review_rows = candidate
+                errors = validate_forecast(candidate)
+                if errors:
+                    for error in errors: st.error(error)
+                else:
+                    st.session_state.forecast_confirmed = normalize_forecast_rows(candidate)
+                    st.session_state.weekly_candidate = None
+                    st.success("Forecast review confirmed. You can now generate the employee shift roster.")
+                    st.rerun()
+        if st.session_state.forecast_confirmed:
+            st.success(f"Confirmed forecast: {st.session_state.forecast_confirmed[0]['date']} through {st.session_state.forecast_confirmed[-1]['date']}.")
+            if st.button("Reopen forecast for edits", key="reopen_forecast"):
+                st.session_state.forecast_review_rows = [dict(row, date=date.fromisoformat(row["date"])) for row in st.session_state.forecast_confirmed]
+                st.session_state.forecast_confirmed = None
+                st.session_state.weekly_candidate = None
+                st.session_state.weekly_candidate_is_draft = False
+                st.rerun()
+
+    else:
+        st.markdown("#### Build the weekly employee shift roster")
+        confirmed = st.session_state.forecast_confirmed
+        if not confirmed:
+            today = date.today(); lookup_friday = today - timedelta(days=(today.weekday() - 4) % 7)
+            lookup = st.date_input("Find saved roster by week start (Friday)", value=lookup_friday, key="saved_roster_lookup")
+            saved_lookup = state_store.get_weekly_roster(WEB_MANAGER_ID, lookup.isoformat())
+            if saved_lookup:
+                st.caption(f"Saved roster version {saved_lookup['version']} · updated {saved_lookup.get('updated_at', 'unknown time')}")
+                if st.button("Load this saved forecast and roster", key="load_saved_week"):
+                    st.session_state.forecast_confirmed = saved_lookup["forecast"]
+                    st.session_state.weekly_candidate = None
+                    st.session_state.weekly_candidate_is_draft = False
+                    st.session_state.weekly_loaded = saved_lookup
+                    st.rerun()
+        confirmed = st.session_state.forecast_confirmed
+        roster_forecast = confirmed
+        draft_forecast = False
+        extraction_needs_review = extraction_requires_review_before_generation(
+            st.session_state.forecast_extraction_method, st.session_state.forecast_review_notices
+        )
+        ai_candidate_comparison = compare_forecast_extractions(
+            st.session_state.forecast_review_rows, st.session_state.forecast_ai_result
+        )
+        ai_conflict_needs_review = any(item["status"] != "AGREE" for item in ai_candidate_comparison)
+        if not confirmed and st.session_state.forecast_review_rows:
+            forecast_errors = validate_forecast(st.session_state.forecast_review_rows)
+            if forecast_errors:
+                st.warning("Forecast values are incomplete or unclear. Review and correct them before a roster can be generated.")
+                if st.session_state.weekly_candidate_is_draft:
+                    st.session_state.weekly_candidate = None
+                    st.session_state.weekly_candidate_is_draft = False
+                for error in forecast_errors:
+                    st.write(f"• {error}")
+            elif extraction_needs_review or ai_conflict_needs_review:
+                st.warning("Extraction needs a person’s review before a roster can be generated. Open the extracted forecast data and confirm it after checking every value.")
+                st.session_state.weekly_candidate = None
+                st.session_state.weekly_candidate_is_draft = False
+            else:
+                roster_forecast = normalize_forecast_rows(st.session_state.forecast_review_rows)
+                draft_forecast = True
+        if roster_forecast:
+            confirmed = roster_forecast
+            existing = state_store.get_weekly_roster(WEB_MANAGER_ID, confirmed[0]["date"])
+            if draft_forecast and (not st.session_state.weekly_candidate or not st.session_state.weekly_candidate_is_draft):
+                try:
+                    st.session_state.weekly_candidate = generate_weekly_roster(confirmed, st.session_state.staff_saved, prior=existing)
+                    st.session_state.weekly_candidate_is_draft = True
+                    st.session_state.weekly_candidate_version = st.session_state.get("weekly_candidate_version", 0) + 1
+                except ValueError as exc:
+                    st.error(f"Draft roster could not be generated: {exc}")
+            if draft_forecast:
+                st.warning("DRAFT ROSTER · Generated from extracted values that passed current checks, but the forecast has not been confirmed. Review forecast data before saving.")
+            st.caption(f"Forecast week · {confirmed[0]['date']} to {confirmed[-1]['date']}")
+            if st.session_state.staff_saved.get("dataset_mode") != "demo":
+                st.warning("Staff & Settings is marked OPERATIONAL. This public no-sign-in demo still must use fictional or non-sensitive data only.")
+            roster_errors = validate_staff_settings(st.session_state.staff_saved)
+            if roster_errors:
+                st.error("Staff & Settings needs correction before generation:")
+                for error in roster_errors: st.write(f"• {error}")
+            else:
+                if st.button("Generate / update weekly roster", type="primary", key="generate_weekly_roster"):
+                    try:
+                        st.session_state.weekly_candidate = generate_weekly_roster(confirmed, st.session_state.staff_saved, prior=existing)
+                        st.session_state.weekly_candidate_is_draft = not bool(st.session_state.forecast_confirmed)
+                        st.session_state.weekly_candidate_version = st.session_state.get("weekly_candidate_version", 0) + 1
+                        st.rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
+            candidate = st.session_state.weekly_candidate
+            if candidate:
+                st.markdown("#### Review generated roster before saving")
+                if candidate["feasible"]:
+                    st.success("No uncovered demand or hard constraint conflict was detected under the current editable assumptions. This is a shift roster, not a room-level plan.")
+                else:
+                    st.error("INCOMPLETE / CONSTRAINTS UNMET · This roster is not feasible under the current inputs. It may be saved for review, but it is not a confirmed workable schedule.")
+                if candidate.get("constraints"):
+                    with st.expander(f"Show {len(candidate['constraints'])} constraints, uncovered demand, or unresolved inputs", expanded=True):
+                        for item in candidate["constraints"]: st.write(f"• {item}")
+                changes = schedule_changes(existing, candidate)
+                if existing:
+                    st.markdown("**Changes compared with the saved version**")
+                    if changes: st.dataframe(pd.DataFrame(changes), hide_index=True, width="stretch")
+                    else: st.caption("No shift changes from the current saved version.")
+                else:
+                    st.caption("This will create the first saved version for this week.")
+                st.markdown("#### Friday–Thursday roster by role")
+                grid = weekly_grid(candidate["schedule"])
+                role_tabs = st.tabs(list(grid))
+                for role_tab, (role, employee_rows) in zip(role_tabs, grid.items()):
+                    with role_tab:
+                        if employee_rows:
+                            st.dataframe(pd.DataFrame(employee_rows), hide_index=True, width="stretch")
+                        else:
+                            st.info(f"No {role.lower()} rows in the current roster.")
+                baseline = pd.DataFrame(candidate["schedule"])
+                with st.form(f"weekly_roster_edit_form_{st.session_state.get('weekly_candidate_version', 0)}"):
+                    edited_schedule = st.data_editor(baseline, key=f"weekly_roster_table_{st.session_state.get('weekly_candidate_version', 0)}", hide_index=True, width="stretch", num_rows="fixed", column_config={
+                        "staff_id": st.column_config.TextColumn("Stable staff ID", disabled=True),
+                        "display_name": st.column_config.TextColumn("Employee", disabled=True),
+                        "role": st.column_config.TextColumn("Role", disabled=True),
+                        "date": st.column_config.TextColumn("Date", disabled=True),
+                        "weekday": st.column_config.TextColumn("Day", disabled=True),
+                        "code": st.column_config.SelectboxColumn("Shift code", options=["SHIFT", "OFF", "R/OFF", "BANQUET", "INSPECT", *[c for c in st.session_state.staff_saved["settings"]["status_codes"] if c not in {"OFF", "R/OFF", "BANQUET", "INSPECT"}]]),
+                        "start": st.column_config.TextColumn("Start (HH:MM)"),
+                        "end": st.column_config.TextColumn("End (HH:MM)"),
+                        "paid_hours": st.column_config.NumberColumn("Paid hours", disabled=True),
+                        "productive_hours": st.column_config.NumberColumn("Productive hours", disabled=True),
+                        "locked": st.column_config.CheckboxColumn("Lock across regeneration"),
+                        "notes": st.column_config.TextColumn("Notes"),
+                    })
+                    review_edits = st.form_submit_button("Review roster edits and update preview")
+                if review_edits:
+                    edits = edited_schedule.to_dict(orient="records")
+                    original_by_key = {(r["staff_id"], r["date"]): r for r in candidate["schedule"]}
+                    for row in edits:
+                        original = original_by_key.get((row["staff_id"], row["date"]), {})
+                        if any(row.get(k) != original.get(k) for k in ("code", "start", "end", "notes")):
+                            row["locked"] = True
+                        if row.get("code") in {"OFF", "R/OFF"}:
+                            row["start"] = row["end"] = ""
+                            row["paid_hours"] = row["productive_hours"] = 0.0
+                    try:
+                        st.session_state.weekly_candidate = generate_weekly_roster(confirmed, st.session_state.staff_saved, prior={"schedule": edits, "version": candidate.get("version", 0)})
+                        st.session_state.weekly_candidate_is_draft = not bool(st.session_state.forecast_confirmed)
+                        st.session_state.weekly_candidate_version += 1
+                        st.rerun()
+                    except ValueError as exc: st.error(str(exc))
+                st.checkbox("I reviewed the displayed changes and want to save or replace this week's roster version.", key=f"confirm_save_roster_{st.session_state.get('weekly_candidate_version', 0)}")
+                if draft_forecast:
+                    st.info("Forecast confirmation is required before this roster can be saved.")
+                if st.button("Save reviewed roster version", key=f"save_roster_{st.session_state.get('weekly_candidate_version', 0)}", disabled=draft_forecast or not st.session_state.get(f"confirm_save_roster_{st.session_state.get('weekly_candidate_version', 0)}", False)):
+                    try:
+                        state_store.save_weekly_roster(WEB_MANAGER_ID, candidate["week_start"], candidate)
+                        st.session_state.weekly_candidate = state_store.get_weekly_roster(WEB_MANAGER_ID, candidate["week_start"])
+                        st.session_state.weekly_candidate_version += 1
+                        st.success("Roster version saved to persistent SQLite storage.")
+                        st.rerun()
+                    except (ValueError, TypeError) as exc: st.error(f"Roster was not saved: {exc}")
+                try:
+                    excel_bytes, pdf_bytes = build_exports(candidate)
+                    xcol, pcol = st.columns(2)
+                    xcol.download_button("Download Excel roster", excel_bytes, file_name=f"weekly-roster-{candidate['week_start']}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"export_xlsx_{st.session_state.get('weekly_candidate_version', 0)}")
+                    pcol.download_button("Download PDF roster", pdf_bytes, file_name=f"weekly-roster-{candidate['week_start']}.pdf", mime="application/pdf", key=f"export_pdf_{st.session_state.get('weekly_candidate_version', 0)}")
+                except ImportError as exc:
+                    st.warning(f"Export dependency unavailable: {exc}. Install the project requirements and retry.")
+        if st.button("View extracted forecast data", type="secondary", key="view_extracted_forecast_data", on_click=set_weekly_forecast_view, args=("Extracted forecast data",)):
+            pass
+
 elif nav == "OPERATIONS":
     st.subheader("Operations")
     tab1, tab2 = st.tabs(["Housekeeping", "Bar & inventory"])

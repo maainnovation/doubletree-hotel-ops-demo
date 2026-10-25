@@ -15,6 +15,7 @@ class StateStore:
                 CREATE TABLE IF NOT EXISTS webhook_messages (message_id TEXT PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, manager_id TEXT NOT NULL, event_json TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
                 CREATE TABLE IF NOT EXISTS staff_settings (manager_id TEXT PRIMARY KEY, payload TEXT NOT NULL, demo_seed_version INTEGER NOT NULL DEFAULT 0, dataset_mode TEXT NOT NULL DEFAULT 'operational', updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
+                CREATE TABLE IF NOT EXISTS weekly_rosters (manager_id TEXT NOT NULL, week_start TEXT NOT NULL, payload TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1, updated_at TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(manager_id,week_start));
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(staff_settings)")}
             if "dataset_mode" not in columns:
@@ -68,3 +69,26 @@ class StateStore:
         encoded = json.dumps(payload)
         with self._connect() as db:
             db.execute("INSERT INTO staff_settings(manager_id,payload,demo_seed_version,dataset_mode) VALUES(?,?,?,?) ON CONFLICT(manager_id) DO UPDATE SET payload=excluded.payload,demo_seed_version=excluded.demo_seed_version,dataset_mode=excluded.dataset_mode,updated_at=CURRENT_TIMESTAMP", (manager_id, encoded, int(demo_seed_version), dataset_mode))
+
+    def get_weekly_roster(self, manager_id, week_start):
+        with self._connect() as db:
+            row = db.execute("SELECT payload,version,updated_at FROM weekly_rosters WHERE manager_id=? AND week_start=?", (manager_id, str(week_start))).fetchone()
+        if not row:
+            return None
+        payload = json.loads(row[0])
+        payload["version"] = row[1]
+        payload["updated_at"] = row[2]
+        return payload
+
+    def save_weekly_roster(self, manager_id, week_start, payload):
+        if not isinstance(payload, dict) or payload.get("week_start") != str(week_start):
+            raise ValueError("Roster week start must match the storage key.")
+        if len(payload.get("forecast", [])) != 7 or not isinstance(payload.get("schedule"), list) or not isinstance(payload.get("constraints"), list):
+            raise ValueError("A saved roster needs seven reviewed forecast days, schedule rows, and an explicit constraints list.")
+        current = self.get_weekly_roster(manager_id, week_start)
+        version = int(current["version"] + 1) if current else 1
+        saved = dict(payload)
+        saved["version"] = version
+        encoded = json.dumps(saved, allow_nan=False)
+        with self._connect() as db:
+            db.execute("INSERT INTO weekly_rosters(manager_id,week_start,payload,version) VALUES(?,?,?,?) ON CONFLICT(manager_id,week_start) DO UPDATE SET payload=excluded.payload,version=excluded.version,updated_at=CURRENT_TIMESTAMP", (manager_id, str(week_start), encoded, version))
