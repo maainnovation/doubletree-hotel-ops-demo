@@ -95,6 +95,12 @@ class ReviewPilotCostMonitor:
                         if len(raw) + len(part) > 65536:
                             raise CostMonitorUnavailable()
                         raw.extend(part)
+            # The provider can generate as_of while this request is in flight.
+            # Compare to observation time, not the earlier poll-start timestamp.
+            # Retain poll-start checked_at below, so cache lifetime is not extended.
+            observed_at = _now(self.clock())
+            if not 0 <= observed_at - now <= MAX_AGE:
+                raise CostMonitorUnavailable()
             payload = json.loads(raw, parse_float=Decimal)
             rows = payload['usage_records']
             if payload.get('next_page_uri') is not None or not isinstance(rows,list) or len(rows) != 1:
@@ -107,7 +113,7 @@ class ReviewPilotCostMonitor:
             if stamp.tzinfo is None or stamp.utcoffset().total_seconds() != 0:
                 raise CostMonitorUnavailable()
             as_of = stamp.timestamp()
-            if not 0 <= now - as_of <= MAX_AGE:
+            if not 0 <= observed_at - as_of <= MAX_AGE:
                 raise CostMonitorUnavailable()
             return _money(row['price']), as_of
         except Exception:

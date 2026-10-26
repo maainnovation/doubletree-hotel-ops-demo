@@ -156,3 +156,39 @@ def test_fresh_poll_cannot_mask_stale_source_timestamp(setup):
     state['mutate']=stale
     assert not m.refresh()
     assert not gate(store,m,state['now'])
+
+
+@pytest.mark.parametrize('operation',['baseline','refresh'])
+def test_valid_timestamp_generated_during_request_is_not_future(setup,operation):
+    store,state,m=setup
+    if operation=='refresh':m.initialize_baseline()
+    started=state['now']
+    def generated_in_flight(p):
+        p['usage_records'][0]['as_of']=datetime.fromtimestamp(started+.2,timezone.utc).isoformat()
+        state['now']=started+.3
+        return p
+    state['mutate']=generated_in_flight
+    assert (m.initialize_baseline() if operation=='baseline' else m.refresh())
+    assert gate(store,m,state['now'])
+    with store._connect() as db:
+        row=db.execute('SELECT checked_at,as_of FROM review_cost_snapshots ORDER BY id DESC LIMIT 1').fetchone()
+    assert row[0]==started and row[1]==started+.2
+    # Cache age still runs from request start, not a later receipt time.
+    assert not gate(store,m,started+300.01)
+
+
+@pytest.mark.parametrize('clock_delta,stamp_delta',[
+    (.3,.4),       # Truly future at receipt remains rejected; no skew tolerance.
+    (.3,-299.9),   # Fresh at start but over300seconds old at receipt is rejected.
+    (-.1,-1),     # Clock rollback invalidates the observation.
+    (301,301),    # An overlong observation/large forward clock jump is rejected.
+])
+def test_response_time_check_preserves_strict_age_and_clock_guards(setup,clock_delta,stamp_delta):
+    store,state,m=setup;m.initialize_baseline();started=state['now']
+    def response(p):
+        p['usage_records'][0]['as_of']=datetime.fromtimestamp(started+stamp_delta,timezone.utc).isoformat()
+        state['now']=started+clock_delta
+        return p
+    state['mutate']=response
+    assert not m.refresh()
+    assert not gate(store,m,state['now'])
