@@ -351,3 +351,232 @@ def test_duplicate_server_auth_configuration_keys_are_rejected(monkeypatch):
     monkeypatch.setenv("PRIVATE_HOTEL_TOKENS_JSON", '[{"token":"' + TOKEN_A + '","tenant_id":"hotel-a","tenant_id":"hotel-b","manager_id":"gm-a"}]')
     with pytest.raises(ValueError, match="Invalid private authentication configuration"):
         TokenMapAuthenticator.from_environment()
+
+
+def test_expiring_owner_key_has_injected_maximum_ten_day_window():
+    from api.private_hotel_app import ExpiringTokenMapAuthenticator
+    now = [1000.0]
+    principal = HotelPrincipal("hotel-a", "gm-a")
+    auth = ExpiringTokenMapAuthenticator({TOKEN_A: principal}, issued_at=1000, expires_at=1000 + 240 * 3600, clock=lambda: now[0])
+    assert auth(TOKEN_A) == principal
+    now[0] = 999
+    assert auth(TOKEN_A) is None
+    now[0] = auth.expires_at - 0.001
+    assert auth(TOKEN_A) == principal
+    now[0] = auth.expires_at
+    assert auth(TOKEN_A) is None
+    for start, end in [(1, 1), (1, 240 * 3600 + 2), (float("nan"), 100), (True, 5)]:
+        with pytest.raises(ValueError):
+            ExpiringTokenMapAuthenticator({TOKEN_A: principal}, issued_at=start, expires_at=end)
+
+
+def upload_app(system):
+    from services.private_forecast_workflow import PrivateForecastWorkflow
+    store, files, _, _ = system
+    calls = []
+    def evaluator(*args, **kwargs):
+        from services.whatsapp_forecast import validate_whatsapp_forecast
+        calls.append(True)
+        return {"method": "native_pdf", "automatic_roster_allowed": True, "requires_review": False,
+                "rows": validate_whatsapp_forecast(forecast_pdf(), "application/pdf", DEMO_CODE, 400, DEMO_NOW)}
+    service = PrivateForecastWorkflow(store, files, clock=lambda: DEMO_NOW.timestamp(),
+        admission_check=lambda tenant, manager, now: tenant == "hotel-a" and manager == "gm-a", media_evaluator=evaluator)
+    auth = TokenMapAuthenticator({TOKEN_A: HotelPrincipal("hotel-a", "gm-a"), TOKEN_B: HotelPrincipal("hotel-b", "gm-b")})
+    app = create_private_app(store, files, auth, forecast_workflow=service)
+    return TestClient(app), service, calls, app
+
+
+def test_optional_upload_disabled_and_workflow_must_share_exact_repository(system, tmp_path):
+    from services.private_forecast_workflow import PrivateForecastWorkflow
+    store, files, _, client = system
+    assert client.get("/private/api/settings", headers=headers()).json()["forecast_uploads_available"] is False
+    for path in ["/private/api/forecast-uploads", "/private/api/forecast-uploads/anything/confirm"]:
+        response = client.post(path, headers=headers(), content=b"not-a-file")
+        assert response.status_code == 503
+    other = PrivateForecastWorkflow(WorkflowStore(tmp_path / "other.sqlite3"), files)
+    with pytest.raises(ValueError, match="same injected"):
+        create_private_app(store, files, forecast_workflow=other)
+
+
+def test_private_upload_http_enqueues_reviews_and_exposes_new_version_without_whatsapp(system):
+    store = system[0]
+    client, service, calls, _ = upload_app(system)
+    assert client.get("/private/api/settings", headers=headers()).json()["forecast_uploads_available"] is True
+    args = {"content": forecast_pdf(), "headers": headers(**{"Content-Type": "application/pdf", "Idempotency-Key": "synthetic-api-upload-1"})}
+    result = client.post("/private/api/forecast-uploads?tenant_id=hotel-b", **args)
+    assert result.status_code == 202 and not calls
+    item = result.json()
+    assert item["status"] == "queued"
+    assert client.post("/private/api/forecast-uploads", **args).json()["id"] == item["id"]
+    assert not client.get("/private/api/rosters", headers=headers()).json()["versions"]
+    assert service.process_one()
+    item = client.get("/private/api/forecast-uploads/" + item["id"], headers=headers()).json()
+    assert item["status"] == "needs_review" and len(item["rows"]) == 7
+    path = "/private/api/forecast-uploads/" + item["id"] + "/confirm"
+    result = client.post(path, headers=headers(), json={"expected_revision": item["revision"]})
+    assert result.status_code == 200 and result.json()["status"] == "confirmed"
+    assert client.post(path, headers=headers(), json={"expected_revision": item["revision"]}).status_code == 409
+    assert not client.get("/private/api/rosters", headers=headers()).json()["versions"]
+    assert service.process_one()
+    versions = client.get("/private/api/rosters", headers=headers()).json()["versions"]
+    assert len(versions) == 1 and versions[0]["source"]["channel"] == "private_app"
+    pdf = client.get(f"/private/api/rosters/{versions[0]['week_start']}/versions/1/pdf", headers=headers())
+    assert pdf.status_code == 200 and pdf.content.startswith(b"%PDF")
+    with store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM wa_jobs").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM wa_outbox").fetchone()[0] == 0
+    view = client.get("/private/api/forecast-uploads", headers=headers()).json()
+    assert "source_key" not in str(view) and "sha256" not in str(view)
+
+
+def test_upload_routes_auth_scope_body_limit_and_invalid_actions(system):
+    client, service, _, _ = upload_app(system)
+    paths = ["/private/api/forecast-uploads", "/private/api/forecast-uploads/unknown/confirm"]
+    for path in paths:
+        assert client.post(path, content=b"secret-file").status_code == 401
+        assert client.post(path, headers=headers(TOKEN_B), content=b"secret-file").status_code == 403
+    assert client.post(paths[0], headers=headers(**{"Content-Type": "text/plain"}), content=b"text").status_code == 415
+    assert client.post(paths[0], headers=headers(**{"Content-Type": "image/png"}), content=b"x" * (5 * 1024 * 1024 + 1)).status_code == 413
+    assert client.post(paths[0], headers=headers(**{"Content-Type": "application/pdf"}), content=b"%PDF").status_code == 422
+    item = client.post(paths[0], headers=headers(**{"Content-Type": "application/pdf", "Idempotency-Key": "synthetic-api-key"}), content=forecast_pdf()).json()
+    assert client.get(paths[0] + "/" + item["id"], headers=headers(TOKEN_B)).status_code == 403
+    assert client.post(paths[0] + "/" + item["id"] + "/confirm", headers=headers(), json={"expected_revision": item["revision"], "tenant_id": "hotel-b"}).status_code == 422
+    assert client.post(paths[0] + "/" + item["id"] + "/cancel", headers=headers(), json={"expected_revision": item["revision"]}).status_code == 200
+    assert not service.process_one()
+
+
+def test_disabled_and_expired_upload_auth_do_not_consume_body(system):
+    import asyncio
+    from api.private_hotel_app import ExpiringTokenMapAuthenticator
+    store, files, app, _ = system
+    async def run(target):
+        messages = []
+        async def receive():
+            raise AssertionError("Disabled or unauthorized upload consumed the source")
+        async def send(message): messages.append(message)
+        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}, "method": "POST", "scheme": "https",
+                 "path": "/private/api/forecast-uploads", "raw_path": b"/private/api/forecast-uploads", "query_string": b"", "root_path": "",
+                 "headers": [(b"authorization", ("Bearer " + TOKEN_A).encode()), (b"content-type", b"application/pdf")],
+                 "client": ("127.0.0.1", 12345), "server": ("test", 443), "http_version": "1.1"}
+        await target(scope, receive, send)
+        return next(message["status"] for message in messages if message["type"] == "http.response.start")
+    assert asyncio.run(run(app)) == 503
+    expired = ExpiringTokenMapAuthenticator({TOKEN_A: HotelPrincipal("hotel-a", "gm-a")}, issued_at=100, expires_at=200, clock=lambda: 200)
+    assert asyncio.run(run(create_private_app(store, files, expired))) == 401
+
+
+def test_nonblocking_upload_intake_allows_one_body_and_releases_after_error(system):
+    import asyncio
+    import httpx
+    _, service, _, app = upload_app(system)
+    async def scenario():
+        started, resume = asyncio.Event(), asyncio.Event()
+        async def slow():
+            started.set()
+            await resume.wait()
+            yield b"synthetic-file"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            kwargs = {"headers": headers(**{"Content-Type": "image/png", "Idempotency-Key": "synthetic-intake-1"})}
+            first = asyncio.create_task(client.post("/private/api/forecast-uploads", content=slow(), **kwargs))
+            await started.wait()
+            second = await client.post("/private/api/forecast-uploads", content=b"synthetic-file", **kwargs)
+            assert second.status_code == 429
+            resume.set()
+            assert (await first).status_code == 202
+            bad = await client.post("/private/api/forecast-uploads", content=b"", **kwargs)
+            assert bad.status_code == 422
+            assert (await client.post("/private/api/forecast-uploads", content=b"synthetic-file", **kwargs)).status_code == 202
+    asyncio.run(scenario())
+
+
+def test_upload_javascript_repeated_cancel_back_and_cross_session_responses():
+    import shutil
+    import subprocess
+    from pathlib import Path
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is required for deterministic upload-JavaScript tests")
+    javascript = Path(__file__).resolve().parents[1] / "api" / "private_app_static" / "app.js"
+    program = r'''
+const assert=require('assert'),fs=require('fs'),vm=require('vm');
+class Element {
+ constructor(){this.value='';this.textContent='';this.hidden=false;this.children=[];this.events={};this.files=[];this.checked=false;this.disabled=false;}
+ addEventListener(n,f){this.events[n]=f;} append(...items){this.children.push(...items);} replaceChildren(...items){this.children=items;this.textContent='';}
+ fire(n){return this.events[n]({preventDefault(){}});} click(){return this.events.click?this.fire('click'):undefined;}
+}
+const defer=()=>{let resolve;const promise=new Promise(r=>resolve=r);return {promise,resolve};};
+const response=(x,status=200)=>({ok:status<400,status,json:async()=>x});
+const settings=(who)=>({hotel_name:who,revision:1,parameters:{room_capacity:292,checkout_minutes:22,stayover_minutes:10},staff:[{display_name:who}],forecast_uploads_available:true});
+const item=(id,status='needs_review')=>({id,status,revision:3,created_at:123,review_expires_at:9999999999,settings_revision:1,message:id+' '+status,rows:[{date:'2026-10-23',departures:1,stayovers:2,arrivals:3,rooms_on_books:4,forecast_pickup:5,forecast_occupied:6,occupancy_pct:2}]});
+async function flush(){for(let i=0;i<20;i++)await Promise.resolve();}
+function harness(){const elements=new Map(),requests=[],events={};let uuid=0;const get=id=>{if(!elements.has(id))elements.set(id,new Element());return elements.get(id);};
+const window={confirm:()=>true,addEventListener:(n,f)=>{events[n]=f;}};
+vm.runInNewContext(fs.readFileSync(process.argv[1],'utf8'),{document:{getElementById:get,createElement:()=>new Element()},window,AbortController,crypto:{randomUUID:()=>`synthetic-key-${++uuid}`},setTimeout,fetch:(url,options)=>{const task=defer();requests.push({url,options,...task});return task.promise;}});
+return {get,requests,events,window};}
+async function login(h,who='A'){h.get('access-token').value='token-'+who;const index=h.requests.length,p=h.get('login-form').fire('submit');h.requests[index].resolve(response(settings(who)));await flush();h.requests[index+1].resolve(response({versions:[]}));await flush();h.requests[index+2].resolve(response({uploads:[item(who)]}));await p;}
+async function view(h,index=0){const start=h.requests.length,p=h.get('uploads').children[index].children[1].fire('click');h.requests[start].resolve(response(item('A')));await p;}
+function cleared(h){assert(h.get('workspace').hidden);assert(h.get('upload-detail').hidden);assert.equal(h.get('review-rows').children.length,0);assert.equal(h.get('forecast-file').value,'');}
+(async()=>{
+let h=harness();await login(h);h.get('forecast-file').files=[{type:'image/png',size:10}];
+let p=h.get('upload-form').fire('submit');assert.equal(h.requests.length,4);await h.get('upload-form').fire('submit');assert.equal(h.requests.length,4);assert(h.get('forecast-file').disabled);
+h.requests[3].resolve(response(item('upload','queued')));await flush();h.requests[4].resolve(response({uploads:[item('upload','queued')]}));await p;assert(!h.get('forecast-file').disabled);assert(!h.get('upload-detail').hidden);
+// A delayed upload cannot show its report or clear B's selected file after a new login.
+h=harness();await login(h);h.get('forecast-file').files=[{type:'application/pdf',size:100}];p=h.get('upload-form').fire('submit');const old=h.requests[3];await login(h,'B');h.get('forecast-file').value='B draft';old.resolve(response(item('A','queued')));await p;assert.equal(h.get('hotel-name').textContent,'B');assert.equal(h.get('forecast-file').value,'B draft');assert(h.get('upload-detail').hidden);assert(old.options.signal.aborted);
+// Close/back while a detail fetch is pending must not reopen that review.
+h=harness();await login(h);p=h.get('uploads').children[0].children[1].fire('click');h.get('close-upload').fire('click');h.requests[3].resolve(response(item('A')));await p;assert(h.get('upload-detail').hidden);
+// A newly requested detail immediately invalidates the previous actionable review.
+h=harness();await login(h);await view(h);h.get('review-checked').checked=true;
+p=h.get('uploads').children[0].children[1].fire('click');const pendingIndex=h.requests.length-1;assert(h.get('upload-detail').hidden);await h.get('confirm-upload').fire('click');assert.equal(h.requests.length,pendingIndex+1);h.requests[pendingIndex].resolve(response(item('new-detail')));await p;assert.equal(h.get('upload-status').textContent,'new-detail needs_review');
+// A previously submitted action cannot overwrite a newer loaded detail.
+h=harness();await login(h);await view(h);h.get('review-checked').checked=true;const oldAction=h.get('confirm-upload').fire('click'),oldActionIndex=h.requests.length-1;
+p=h.get('uploads').children[0].children[1].fire('click');h.requests.at(-1).resolve(response(item('newer-detail')));await p;h.requests[oldActionIndex].resolve(response(item('A','confirmed')));await flush();h.requests.at(-1).resolve(response({uploads:[item('newer-detail')]}));await oldAction;assert.equal(h.get('upload-status').textContent,'newer-detail needs_review');
+// Confirm requires explicit checkbox and repeated actions create one request.
+h=harness();await login(h);await view(h);const before=h.requests.length;await h.get('confirm-upload').fire('click');assert.equal(h.requests.length,before);
+h.get('review-checked').checked=true;h.get('review-checked').fire('change');p=h.get('confirm-upload').fire('click');await h.get('confirm-upload').fire('click');assert.equal(h.requests.length,before+1);assert.equal(JSON.parse(h.requests.at(-1).options.body).expected_revision,3);
+h.requests[before].resolve(response(item('A','confirmed')));await flush();h.requests[before+1].resolve(response({uploads:[item('A','confirmed')]}));await p;assert(h.get('confirm-upload').hidden);
+// Declining cancel sends nothing; accepted cancel and regeneration remain session-scoped.
+for(const action of ['cancel','regenerate','confirm']){h=harness();await login(h);await view(h);h.get('review-checked').checked=true;
+if(action==='cancel'){h.window.confirm=()=>false;await h.get('cancel-upload').fire('click');assert.equal(h.requests.length,4);h.window.confirm=()=>true;}
+p=h.get(action+'-upload').fire('click');const waiting=h.requests.at(-1);h.get('logout').fire('click');cleared(h);waiting.resolve(response(item('A',action==='cancel'?'cancelled':'queued')));await p;cleared(h);assert(waiting.options.signal.aborted);}
+// bfcache Back/Forward cannot preserve an authenticated workspace.
+h=harness();await login(h);await view(h);h.events.pagehide();cleared(h);
+console.log('Upload UI race checks passed');
+})().catch(e=>{console.error(e);process.exitCode=1});
+'''
+    result = subprocess.run([node, "-e", program, str(javascript)], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Upload UI race checks passed" in result.stdout
+
+
+def test_slow_upload_timeout_releases_intake(system, monkeypatch):
+    import asyncio
+    import httpx
+    import api.private_hotel_app as module
+    _, _, _, app = upload_app(system)
+    monkeypatch.setattr(module, "BODY_TIMEOUT_SECONDS", 0.01)
+    async def scenario():
+        async def slow():
+            await asyncio.sleep(1)
+            yield b"synthetic-file"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            args = {"headers": headers(**{"Content-Type": "image/png", "Idempotency-Key": "synthetic-timeout"})}
+            assert (await client.post("/private/api/forecast-uploads", content=slow(), **args)).status_code == 408
+            assert (await client.post("/private/api/forecast-uploads", content=b"synthetic-file", **args)).status_code == 202
+    asyncio.run(scenario())
+
+
+def test_shared_storage_quota_returns_operator_only_507_without_enqueuing(system, tmp_path):
+    from services.private_storage_budget import QuotaPrivateFileStore
+    from services.private_forecast_workflow import PrivateForecastWorkflow
+    store = system[0]
+    files = QuotaPrivateFileStore(tmp_path / "bounded-private", max_bytes=3, free_reserve_bytes=0)
+    files.put("hotel-b", b"old", "pdf")  # Shared storage, not just this manager's uploads.
+    service = PrivateForecastWorkflow(store, files, clock=lambda: DEMO_NOW.timestamp(), admission_check=lambda *args: True)
+    auth = TokenMapAuthenticator({TOKEN_A: HotelPrincipal("hotel-a", "gm-a")})
+    client = TestClient(create_private_app(store, files, auth, forecast_workflow=service))
+    response = client.post("/private/api/forecast-uploads", content=b"new-file", headers=headers(**{"Content-Type": "image/png", "Idempotency-Key": "synthetic-quota-upload"}))
+    assert response.status_code == 507
+    assert "Contact the operator" in response.json()["detail"] and "do not repeatedly resend" in response.json()["detail"]
+    assert not service.list_uploads("hotel-a", "gm-a")
+    with store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM wa_outbox").fetchone()[0] == 0

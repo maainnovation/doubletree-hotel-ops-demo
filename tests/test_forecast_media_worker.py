@@ -264,3 +264,51 @@ print(json.dumps({{'parent_peak': parent_peak, 'worker': result['isolation']}}))
     assert 0 < measured["worker"]["worker_peak_rss_kib"] < 384 * 1024
     assert measured["worker"]["worker_peak_rss_kib"] < measured["parent_peak"] - 16 * 1024
     assert measured["worker"]["worker_peak_rss_source"] == "proc_self_status_VmHWM"
+
+
+def test_memory_guard_refuses_admission_before_request_serialization_or_spawn(monkeypatch):
+    monkeypatch.setattr(worker.base64, "b64encode", lambda *args: pytest.fail("No request allocation before admission"))
+    monkeypatch.setattr(worker.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("Must not spawn"))
+    with pytest.raises(worker.ForecastMediaWorkerError, match="memory headroom"):
+        assess(memory_guard=lambda phase: False)
+
+
+def test_memory_guard_exception_is_sanitized_and_fails_closed(monkeypatch):
+    def guard(phase):
+        raise RuntimeError("SECRET")
+    with pytest.raises(worker.ForecastMediaWorkerError) as error:
+        assess(memory_guard=guard)
+    assert "SECRET" not in str(error.value)
+
+
+@pytest.mark.parametrize("close_stdout", [False, True])
+def test_memory_guard_is_polled_and_kills_silent_process_group(monkeypatch, tmp_path, close_stdout):
+    marker = tmp_path / "guard-descendant.txt"
+    fake_command(monkeypatch, "import os,subprocess,sys,time; "
+                 + ("os.close(1); " if close_stdout else "") +
+                 "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(90)'],stdout=subprocess.DEVNULL); "
+                 f"open({str(marker)!r},'w').write(str(child.pid));time.sleep(90)")
+    directories = track_private_directories(monkeypatch)
+    running_calls = []
+    def guard(phase):
+        if phase == "running":
+            running_calls.append(time.monotonic())
+        return len(running_calls) < 5
+    started = time.monotonic()
+    with pytest.raises(worker.ForecastMediaWorkerError, match="memory headroom"):
+        assess(memory_guard=guard)
+    assert time.monotonic() - started < 2
+    assert len(running_calls) == 5 and all(not path.exists() for path in directories)
+    pid = int(marker.read_text())
+    stat = Path(f"/proc/{pid}/stat")
+    assert not stat.exists() or stat.read_text().split()[2] == "Z"
+
+
+def test_real_worker_with_permissive_memory_guard_preserves_result():
+    phases = []
+    def guard(phase):
+        phases.append(phase)
+        return True
+    result = assess(memory_guard=guard)
+    assert result["automatic_roster_allowed"] and len(result["rows"]) == 7
+    assert "admission" in phases and "running" in phases

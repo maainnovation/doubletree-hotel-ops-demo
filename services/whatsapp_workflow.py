@@ -27,12 +27,16 @@ _ACK_ACCEPTED = {"accepted", "sent", "delivered", "read"}
 
 class ForecastWorker:
     def __init__(self, store, files, provider, clock=time.time, *, acknowledge_uploads=False, review_images=False, media_evaluator=None):
-        if review_images and getattr(provider,'is_live',False):
-            raise ValueError('General photo/review workflow is local-only until its private deployment and sending scope are approved.')
-        if getattr(provider, "is_live", False) and (getattr(store, "development_only", True) or getattr(files, "development_only", True)):
-            from services.twilio_pilot import SyntheticPilotProvider
-            if not isinstance(provider, SyntheticPilotProvider) or not provider.permits_development_storage(store, files):
-                raise ValueError("Live WhatsApp is blocked with development storage; approved production adapters are required")
+        if getattr(provider, "is_live", False):
+            from services.twilio_review_pilot import ReviewPilotProvider
+            approved_review=(type(provider) is ReviewPilotProvider and provider.permits_review(store,files))
+            if review_images and not approved_review:
+                raise ValueError('Live WhatsApp is blocked unless the separately approved owner review runtime is used.')
+            if getattr(store, "development_only", True) or getattr(files, "development_only", True):
+                from services.twilio_pilot import SyntheticPilotProvider
+                approved_legacy=(isinstance(provider,SyntheticPilotProvider) and provider.permits_development_storage(store,files))
+                if not (approved_review or approved_legacy):
+                    raise ValueError("Live WhatsApp is blocked with development storage; approved production adapters are required")
         if not isinstance(acknowledge_uploads, bool):
             raise ValueError("Acknowledgement enable flag must be boolean")
         if not isinstance(review_images,bool):
@@ -151,7 +155,11 @@ class ForecastWorker:
                     return True
             self._persist_roster(job, enrolled, rows, source_hash, source_key, saved_settings["_settings_revision"])
         except ForecastNeedsCorrection as exc:
-            self._correction(job, f"Forecast needs correction: {str(exc)[:1800]} No roster was changed. Resend the corrected complete native-text PDF, or review it in the app.")
+            from services.private_storage_budget import PrivateStorageQuotaError
+            if isinstance(exc, PrivateStorageQuotaError):
+                self._correction(job, "Private storage is full or unavailable. No roster was changed. Contact the operator; do not repeatedly resend the file.")
+            else:
+                self._correction(job, f"Forecast needs correction: {str(exc)[:1800]} No roster was changed. Resend the corrected complete native-text PDF, or review it in the app.")
         except RetryableProviderError:
             if not self._terminal_ack_failure(job):
                 self.store.job_failed(job, now, "media_temporarily_unavailable")

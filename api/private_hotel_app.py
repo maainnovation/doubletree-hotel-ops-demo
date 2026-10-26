@@ -7,15 +7,18 @@ identity lifecycle/roles, rate limits, audit/retention and production storage.
 """
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import re
+import time
 from typing import Callable
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
@@ -30,6 +33,7 @@ from services.weekly_roster import build_exports, roster_calculation_summary
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}\Z")
 STATIC = Path(__file__).with_name("private_app_static")
 MAX_BODY = 2 * 1024 * 1024
+BODY_TIMEOUT_SECONDS = 30
 CALCULATION_SCOPE = {
     "weekly_cleaning_demand": "departures × checkout minutes + all stayovers × stayover minutes",
     "productive_shift_time": "paid shift time minus breaks and other duties",
@@ -110,6 +114,32 @@ class TokenMapAuthenticator:
             raise ValueError("Invalid private authentication configuration") from None
 
 
+class ExpiringTokenMapAuthenticator(TokenMapAuthenticator):
+    """Operator-supplied owner key, bounded by the injected approved window.
+
+    No key is generated. The maximum supported owner pilot is 240 hours;
+    deployment supplies its actual activation and expiry, not browser values.
+    """
+    def __init__(self, mapping, *, issued_at, expires_at, clock=time.time):
+        if (any(type(value) not in {int, float} or not math.isfinite(value) for value in (issued_at, expires_at))
+                or not 0 < expires_at - issued_at <= 240 * 3600):
+            raise ValueError("An explicit owner access window of at most 240 hours is required")
+        super().__init__(mapping)
+        self.issued_at, self.expires_at, self.clock = issued_at, expires_at, clock
+
+    def __call__(self, token):
+        now = self.clock()
+        if type(now) not in {int, float} or not math.isfinite(now) or not self.issued_at <= now < self.expires_at:
+            return None
+        return super().__call__(token)
+
+
+class UploadAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: StrictInt = Field(ge=1)
+    request_key: str | None = Field(default=None, min_length=8, max_length=80)
+
+
 class ParameterEdit(BaseModel):
     model_config = ConfigDict(extra="forbid")
     values: dict = Field(min_length=1, max_length=3)
@@ -152,11 +182,17 @@ def _summary(roster):
     return {key: safe[key] for key in ("week_start", "week_end", "version", "updated_at", "feasible", "source") if key in safe}
 
 
-def create_private_app(store, files, authenticator: Callable[[str], HotelPrincipal | None] | None = None) -> FastAPI:
+def create_private_app(store, files, authenticator: Callable[[str], HotelPrincipal | None] | None = None, *, forecast_workflow=None) -> FastAPI:
     """Use precisely the supplied worker store/files, with fail-closed auth."""
     app = FastAPI(title="Private hotel development workspace", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.workflow_store = store
     app.state.private_files = files  # Never mounted or exposed as a public route.
+    if forecast_workflow is not None and (forecast_workflow.store is not store or forecast_workflow.files is not files):
+        raise ValueError("Private upload workflow must use the same injected store and files")
+    app.state.forecast_workflow = forecast_workflow
+    # Deployment invariant: exactly ONE API process/replica. This process-local
+    # intake gate is not a distributed concurrency limiter.
+    upload_intake = asyncio.Lock()
     authenticate = authenticator or (lambda token: None)
 
     def resolve(request):
@@ -182,20 +218,48 @@ def create_private_app(store, files, authenticator: Callable[[str], HotelPrincip
 
     @app.middleware("http")
     async def private_boundary(request: Request, call_next):
+        intake_owned = False
         try:
             if request.url.path.startswith("/private/api"):
                 resolve(request)  # Authentication precedes parsing any private request body.
                 if request.method in {"POST", "PUT", "PATCH"}:
-                    chunks, size = [], 0
-                    async for chunk in request.stream():
-                        size += len(chunk)
-                        if size > MAX_BODY:
-                            raise HTTPException(413, "Request body exceeds the development limit")
-                        chunks.append(chunk)
-                    request._body = b"".join(chunks)
+                    limit = MAX_BODY
+                    if request.url.path.startswith("/private/api/forecast-uploads"):
+                        if forecast_workflow is None:
+                            raise HTTPException(503, "Private forecast uploads are not configured")
+                        who = request.state.principal
+                        if not forecast_workflow.available(who.tenant_id, who.manager_id):
+                            raise HTTPException(403, "Owner upload approval or synthetic hotel setup is unavailable")
+                    if request.method == "POST" and request.url.path == "/private/api/forecast-uploads":
+                        mime = request.headers.get("content-type", "")
+                        if mime not in {"application/pdf", "image/png", "image/jpeg"}:
+                            raise HTTPException(415, "Use a PDF, PNG or JPEG")
+                        limit = (10 if mime == "application/pdf" else 5) * 1024 * 1024
+                        # Reject excess concurrent bodies, rather than accumulating
+                        # an unbounded in-memory wait queue on a small pilot host.
+                        if upload_intake.locked():
+                            raise HTTPException(429, "Another upload is being received; try again after it completes")
+                        await upload_intake.acquire()
+                        intake_owned = True
+                    async def bounded_body():
+                        chunks, size = [], 0
+                        async for chunk in request.stream():
+                            size += len(chunk)
+                            if size > limit:
+                                raise HTTPException(413, "Request body exceeds the private upload limit")
+                            chunks.append(chunk)
+                        return b"".join(chunks)
+                    try:
+                        request._body = await asyncio.wait_for(bounded_body(), timeout=BODY_TIMEOUT_SECONDS)
+                    except TimeoutError:
+                        raise HTTPException(408, "Upload took too long; resend the file") from None
+                    resolve(request)  # A slow body cannot outlive owner-key expiry.
             response = await call_next(request)
         except HTTPException as exc:
             response = JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
+        finally:
+            if intake_owned:
+                upload_intake.release()
         response.headers.update({
             "Cache-Control": "no-store", "Pragma": "no-cache", "X-Content-Type-Options": "nosniff",
             "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY",
@@ -257,7 +321,7 @@ def create_private_app(store, files, authenticator: Callable[[str], HotelPrincip
     def settings(request: Request, response: Response, who=Depends(principal)):
         saved = saved_settings(who)
         set_revision(response, saved["_settings_revision"])
-        return {"hotel_name": request.state.hotel_name, **settings_response(saved)}
+        return {"hotel_name": request.state.hotel_name, "forecast_uploads_available": bool(forecast_workflow and forecast_workflow.available(who.tenant_id, who.manager_id)), **settings_response(saved)}
 
     @app.get("/private/api/parameters")
     def parameters(response: Response, who=Depends(principal)):
@@ -314,6 +378,48 @@ def create_private_app(store, files, authenticator: Callable[[str], HotelPrincip
         saved = dict(candidate, _settings_revision=new_revision, _dataset_mode=current["_dataset_mode"])
         set_revision(response, new_revision)
         return settings_response(saved)
+
+    def upload_service():
+        if forecast_workflow is None:
+            raise HTTPException(503, "Private forecast uploads are not configured")
+        return forecast_workflow
+
+    def upload_call(method, *args, **kwargs):
+        from services.private_forecast_workflow import PrivateForecastError
+        from services.private_storage_budget import PrivateStorageQuotaError
+        from services.whatsapp_forecast import ForecastNeedsCorrection
+        try:
+            return method(*args, **kwargs)
+        except PrivateForecastError as exc:
+            raise HTTPException(exc.status_code, exc.detail) from None
+        except PrivateStorageQuotaError:
+            raise HTTPException(507, "Private storage quota reached. Contact the operator; do not repeatedly resend the file.") from None
+        except ForecastNeedsCorrection:
+            raise HTTPException(409, "The candidate is no longer valid; upload the current complete report again") from None
+
+    @app.post("/private/api/forecast-uploads", status_code=202)
+    async def upload_forecast(request: Request, who=Depends(principal)):
+        service = upload_service()
+        return upload_call(service.enqueue, who.tenant_id, who.manager_id, await request.body(),
+                           request.headers.get("content-type", ""), request.headers.get("idempotency-key"))
+
+    @app.get("/private/api/forecast-uploads")
+    def list_uploads(who=Depends(principal)):
+        service = upload_service()
+        return {"uploads": upload_call(service.list_uploads, who.tenant_id, who.manager_id)}
+
+    @app.get("/private/api/forecast-uploads/{upload_id}")
+    def get_upload(upload_id: str, who=Depends(principal)):
+        service = upload_service()
+        return upload_call(service.get, who.tenant_id, who.manager_id, upload_id)
+
+    @app.post("/private/api/forecast-uploads/{upload_id}/{action}")
+    def upload_action(upload_id: str, action: str, body: UploadAction, who=Depends(principal)):
+        service = upload_service()
+        if action not in {"confirm", "cancel", "regenerate"}:
+            raise HTTPException(404, "Not found")
+        return upload_call(service.action, who.tenant_id, who.manager_id, upload_id, action,
+                           body.expected_revision, body.request_key)
 
     @app.get("/private/api/rosters")
     def rosters(who=Depends(principal)):

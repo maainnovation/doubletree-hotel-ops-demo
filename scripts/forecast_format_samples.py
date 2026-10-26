@@ -10,6 +10,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+import os
+
+# This file also supports direct script execution outside package startup.
+os.environ["ORT_DISABLE_TELEMETRY"] = "1"
+
 from PIL import Image, ImageDraw, ImageFont
 import pymupdf
 from reportlab.lib.pagesizes import landscape, letter

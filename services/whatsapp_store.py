@@ -294,7 +294,7 @@ class WorkflowStore(StateStore):
                             db.execute("UPDATE wa_senders SET last_inbound=MAX(last_inbound,?) WHERE phone_number_id=? AND sender=?", (min(timestamp, now), phone_id, sender))
         return accepted
 
-    def ingest_twilio(self, form, now: float, *, account_sid: str, business_sender: str, max_jobs=None) -> int:
+    def ingest_twilio(self, form, now: float, *, account_sid: str, business_sender: str, max_jobs=None, admission_hook=None) -> int:
         """Signed form envelope only. No fetch; receipt time never opens a send window.
 
         Twilio does not sign a timestamp. The worker must verify the immutable
@@ -316,7 +316,11 @@ class WorkflowStore(StateStore):
             enrolled = self._enrollment(db, phone_id, sender)
             if not enrolled:
                 return 0
-            if max_jobs is not None and not db.execute("SELECT 1 FROM wa_jobs WHERE phone_number_id=? AND message_id=?", (phone_id, message_id)).fetchone():
+            # An immutable provider message redelivery must not spend a new
+            # campaign intake slot or extend its customer-service window.
+            if db.execute("SELECT 1 FROM wa_jobs WHERE phone_number_id=? AND message_id=?", (phone_id, message_id)).fetchone():
+                return 0
+            if max_jobs is not None:
                 if not isinstance(max_jobs, int) or isinstance(max_jobs, bool) or not 1 <= max_jobs <= 100 or db.execute("SELECT COUNT(*) FROM wa_jobs").fetchone()[0] >= max_jobs:
                     raise ValueError("Pilot intake limit reached")
             media = {"type": "unsupported", "_provider": "twilio"}
@@ -336,7 +340,16 @@ class WorkflowStore(StateStore):
                 raise ValueError("Unexpected extra media")
             media["_enrolled_report_profile"] = enrolled["report_profile"]
             media["_enrollment_binding"] = self.enrollment_binding(enrolled)
-            return db.execute("INSERT OR IGNORE INTO wa_jobs(id,phone_number_id,message_id,sender,tenant_id,inbound_at,media_json,available_at) VALUES(?,?,?,?,?,?,?,?)", (uuid.uuid4().hex, phone_id, message_id, sender, enrolled["tenant_id"], now, json.dumps(media), now)).rowcount
+            job={"id":uuid.uuid4().hex,"phone_number_id":phone_id,"message_id":message_id,"sender":sender,
+                 "tenant_id":enrolled["tenant_id"],"inbound_at":now,"media_json":json.dumps(media),"available_at":now}
+            if admission_hook is not None:
+                if not callable(admission_hook):
+                    raise ValueError("Invalid admission policy")
+                db.row_factory=sqlite3.Row
+                if admission_hook(db,job,now) is not True:
+                    raise ValueError("Message is outside the explicitly approved intake scope")
+            return db.execute("INSERT INTO wa_jobs(id,phone_number_id,message_id,sender,tenant_id,inbound_at,media_json,available_at) VALUES(?,?,?,?,?,?,?,?)",
+                              tuple(job[key] for key in ("id","phone_number_id","message_id","sender","tenant_id","inbound_at","media_json","available_at"))).rowcount
 
     def twilio_status(self, form, now: float, *, account_sid: str, business_sender: str):
         """Signed callbacks reconcile known IDs only, never unknown/lost acknowledgements."""

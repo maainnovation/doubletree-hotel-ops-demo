@@ -43,7 +43,7 @@ def _safe_environment(private_directory: str) -> dict[str, str]:
         "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1",
         "OMP_THREAD_LIMIT": "1", "MKL_NUM_THREADS": "1",
         "NUMEXPR_NUM_THREADS": "1", "VECLIB_MAXIMUM_THREADS": "1",
-        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1", "ORT_DISABLE_TELEMETRY": "1",
     }
 
 
@@ -64,9 +64,21 @@ def _kill_group(process) -> None:
         pass
 
 
-def _run_worker_process(request: bytes, timeout_seconds: float) -> tuple[bytes, float]:
+def _check_memory_guard(memory_guard, phase):
+    if memory_guard is None:
+        return
+    try:
+        permitted = memory_guard(phase) is True
+    except Exception:
+        permitted = False
+    if not permitted:
+        raise ForecastMediaWorkerError("Local forecast review has insufficient verified service memory headroom. Retry later or use manual review.")
+
+
+def _run_worker_process(request: bytes, timeout_seconds: float, *, memory_guard=None) -> tuple[bytes, float]:
     if sys.platform != "linux" or not hasattr(os, "killpg"):
         raise ForecastMediaWorkerError("Local isolated review is unavailable on this host; use the native PDF or manual review.")
+    _check_memory_guard(memory_guard, "admission")
     started = time.monotonic()
     deadline = started + timeout_seconds
     with tempfile.TemporaryDirectory(prefix="forecast-review-") as directory:
@@ -86,10 +98,13 @@ def _run_worker_process(request: bytes, timeout_seconds: float) -> tuple[bytes, 
                 with selectors.DefaultSelector() as selector:
                     selector.register(process.stdout, selectors.EVENT_READ)
                     while True:
+                        _check_memory_guard(memory_guard, "running")
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             raise ForecastMediaWorkerError("Local forecast review reached its time limit. Resend a clearer report or use manual review.")
-                        if not selector.select(remaining):
+                        if not selector.select(min(remaining, 0.05) if memory_guard is not None else remaining):
+                            if memory_guard is not None:
+                                continue
                             raise ForecastMediaWorkerError("Local forecast review reached its time limit. Resend a clearer report or use manual review.")
                         chunk = os.read(process.stdout.fileno(), min(65536, MAX_RESPONSE_BYTES + 1 - total))
                         if not chunk:
@@ -98,12 +113,23 @@ def _run_worker_process(request: bytes, timeout_seconds: float) -> tuple[bytes, 
                         if total > MAX_RESPONSE_BYTES:
                             raise ForecastMediaWorkerError("Local forecast review exceeded its response limit. Resend a simpler report or use manual review.")
                         chunks.append(chunk)
-                try:
-                    code = process.wait(timeout=max(0.001, deadline - time.monotonic()))
-                except subprocess.TimeoutExpired:
-                    raise ForecastMediaWorkerError("Local forecast review reached its time limit. Resend a clearer report or use manual review.") from None
+                # A native child can close stdout before exiting. Keep the
+                # service guard live during that final wait too, not only while
+                # the protocol pipe is open.
+                while True:
+                    _check_memory_guard(memory_guard, "running")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ForecastMediaWorkerError("Local forecast review reached its time limit. Resend a clearer report or use manual review.")
+                    try:
+                        code = process.wait(timeout=min(remaining, 0.05) if memory_guard is not None else remaining)
+                        break
+                    except subprocess.TimeoutExpired:
+                        if memory_guard is None:
+                            raise ForecastMediaWorkerError("Local forecast review reached its time limit. Resend a clearer report or use manual review.") from None
                 if code != 0:
                     raise ForecastMediaWorkerError("Local forecast review could not finish within its safety limits. Resend the native PDF or use manual review.")
+                _check_memory_guard(memory_guard, "running")
                 return b"".join(chunks), time.monotonic() - started
             except OSError:
                 raise ForecastMediaWorkerError("The isolated local review process is unavailable. Use the native PDF or manual review.") from None
@@ -116,13 +142,16 @@ def _run_worker_process(request: bytes, timeout_seconds: float) -> tuple[bytes, 
 
 def evaluate_forecast_media_isolated(
     data, mime_type, hotel_code, room_capacity, now, *,
-    report_profile="canonical_v1", hotel_name=None, timeout_seconds=WALL_TIMEOUT_SECONDS,
+    report_profile="canonical_v1", hotel_name=None, timeout_seconds=WALL_TIMEOUT_SECONDS, memory_guard=None,
 ):
     """Return the assessment dict plus non-sensitive ``isolation`` measurements.
 
     No enrollment, settings, roster, provider or durable storage is changed.
     Unsupported/resource failures are explicit errors, never automatic retries.
     ``timeout_seconds`` can shorten, but cannot raise, the hard wall deadline.
+    Optional ``memory_guard(phase)`` must return True for admission/running.
+    It stays in the parent and is polled at most every 50ms while waiting. This
+    watchdog cannot replace a hard aggregate cgroup limit or prevent every OOM.
     """
     if not isinstance(mime_type, str) or mime_type not in {"application/pdf", "image/png", "image/jpeg"} or not isinstance(data, bytes) or not data:
         raise ValueError("Supply a nonempty PDF, PNG or JPEG for local review.")
@@ -136,13 +165,16 @@ def evaluate_forecast_media_isolated(
         raise ValueError("Explicit supported enrollment, saved capacity and reference time are required.")
     if type(timeout_seconds) not in {int, float} or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= WALL_TIMEOUT_SECONDS:
         raise ValueError("The local review deadline must be positive and at most 35 seconds.")
+    if memory_guard is not None and not callable(memory_guard):
+        raise ValueError("The optional memory guard must be callable.")
+    _check_memory_guard(memory_guard, "admission")
     request = json.dumps({"data": base64.b64encode(data).decode("ascii"), "mime_type": mime_type,
                           "hotel_code": hotel_code, "room_capacity": room_capacity,
                           "now": now.isoformat(), "report_profile": report_profile,
                           "hotel_name": hotel_name}, allow_nan=False, separators=(",", ":")).encode()
     if len(request) > MAX_REQUEST_BYTES:
         raise ValueError("The local review request exceeds its size limit.")
-    raw, elapsed = _run_worker_process(request, float(timeout_seconds))
+    raw, elapsed = _run_worker_process(request, float(timeout_seconds), memory_guard=memory_guard)
     try:
         envelope = json.loads(raw)
         if not isinstance(envelope, dict) or envelope.get("ok") is not True or not isinstance(envelope.get("result"), dict):

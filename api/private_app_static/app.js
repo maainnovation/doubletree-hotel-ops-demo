@@ -3,6 +3,8 @@
   const $ = (id) => document.getElementById(id);
   let token = "", generation = 0, parameterRevision = null, staffRevision = null;
   let parameterDirty = false, staffDirty = false, selectedRoster = null;
+  let uploadsAvailable = false, selectedUpload = null, uploadSelection = 0;
+  let uploadBusy = false, actionBusy = false, uploadRequestKey = null;
   const pendingRequests = new Set();
   const context = () => ({generation, token});
   const active = (session) => session.generation === generation && session.token === token;
@@ -14,6 +16,12 @@
     for (const controller of pendingRequests) controller.abort();
     pendingRequests.clear(); parameterRevision = staffRevision = null; selectedRoster = null;
     parameterDirty = staffDirty = false; $("access-token").value = "";
+    uploadsAvailable = false; selectedUpload = null; uploadSelection += 1;
+    uploadBusy = actionBusy = false; uploadRequestKey = null;
+    $("forecast-file").value = ""; $("forecast-file").disabled = false; $("review-checked").checked = false;
+    $("upload-submit").disabled = false;
+    $("upload-workflow").hidden = true; $("upload-unavailable").hidden = false; $("upload-detail").hidden = true;
+    ["uploads", "review-rows", "upload-title", "upload-status", "upload-deadline"].forEach((id) => $(id).replaceChildren());
     ["hotel-name", "revision", "versions", "calculations", "constraints", "schedule", "roster-title", "roster-status"].forEach((id) => $(id).replaceChildren());
     ["capacity", "checkout", "stayover", "staff-json"].forEach((id) => { $(id).value = ""; });
     $("workspace").hidden = true; $("roster-detail").hidden = true; $("login").hidden = false;
@@ -32,6 +40,10 @@
       check(session);
       if (response.status === 401 || response.status === 403) throw Object.assign(new Error("Access is unavailable. Sign in again or contact your operator."), {authFailure: true});
       if (response.status === 409) throw new Error("Saved data changed. Your draft was not saved. Reload, then reapply your edits.");
+      if (response.status === 507) throw new Error("Private storage quota reached. Contact the operator; do not repeatedly resend the file.");
+      if (response.status === 413) throw new Error("File is too large. Use a PDF up to 10 MB or PNG/JPEG up to 5 MB.");
+      if (response.status === 429) throw new Error("Upload limit reached or another upload is being received. Wait, refresh, or cancel pending reviews.");
+      if (response.status === 410) throw new Error("The saved source expired. Upload the original report again.");
       if (!response.ok) throw new Error(response.status === 422 ? "The submitted values are invalid. Check counts, staff JSON, availability and limits." : "The request could not be completed. Check your operator setup or retry.");
       const result = await (format === "blob" ? response.blob() : response.json());
       check(session); return result;
@@ -40,6 +52,10 @@
   }
   function applySettings(data, force = false, section = "") {
     if (data.hotel_name) $("hotel-name").textContent = data.hotel_name;
+    if (Object.prototype.hasOwnProperty.call(data, "forecast_uploads_available")) {
+      uploadsAvailable = data.forecast_uploads_available === true;
+      $("upload-workflow").hidden = !uploadsAvailable; $("upload-unavailable").hidden = uploadsAvailable;
+    }
     $("revision").textContent = "Saved settings revision " + data.revision;
     if (force || !parameterDirty || section === "parameters") {
       $("capacity").value = data.parameters.room_capacity ?? "";
@@ -90,7 +106,97 @@
   async function reload(session) {
     const data = await api("/settings", {}, "json", session); check(session); applySettings(data, true);
     await loadVersions(session); check(session);
+    if (uploadsAvailable) { await loadUploads(session); check(session); }
   }
+  const uploadActive = (session, selection) => active(session) && selection === uploadSelection;
+  function closeUpload() {
+    uploadSelection += 1; selectedUpload = null; $("upload-detail").hidden = true;
+    $("review-rows").replaceChildren(); $("review-checked").checked = false;
+  }
+  function showUpload(item) {
+    selectedUpload = item; $("upload-detail").hidden = false;
+    $("upload-title").textContent = "Upload · " + item.status.replaceAll("_", " ");
+    $("upload-status").textContent = item.message;
+    $("upload-deadline").textContent = item.review_expires_at ? "Review deadline: " + new Date(item.review_expires_at * 1000).toLocaleString() + " · Saved settings revision " + item.settings_revision : "";
+    $("review-checked").checked = false; $("review-rows").replaceChildren();
+    const review = item.status === "needs_review";
+    $("review-table").hidden = $("review-check-label").hidden = $("confirm-upload").hidden = !review;
+    $("confirm-upload").disabled = true;
+    $("cancel-upload").hidden = !["queued", "extracting", "needs_review", "confirmed", "calculating"].includes(item.status);
+    $("regenerate-upload").hidden = ["queued", "extracting", "confirmed", "calculating", "expired", "blocked", "storage_blocked"].includes(item.status);
+    ["cancel-upload", "regenerate-upload"].forEach((id) => { $(id).disabled = actionBusy; });
+    (item.rows || []).forEach((row) => {
+      const tr = document.createElement("tr");
+      ["date", "departures", "stayovers", "arrivals", "rooms_on_books", "forecast_pickup", "forecast_occupied", "occupancy_pct"].forEach((key) => { const td = document.createElement("td"); td.textContent = row[key]; tr.append(td); });
+      $("review-rows").append(tr);
+    });
+  }
+  async function loadUploads(session) {
+    if (!uploadsAvailable) return;
+    const data = await api("/forecast-uploads", {}, "json", session); check(session); $("uploads").replaceChildren();
+    if (!data.uploads.length) { $("uploads").textContent = "No app uploads yet."; return; }
+    data.uploads.forEach((item) => {
+      const div = document.createElement("div"), span = document.createElement("span"), button = document.createElement("button");
+      div.className = "upload-entry"; span.textContent = `${new Date(item.created_at * 1000).toLocaleString()} · ${item.status.replaceAll("_", " ")}${item.result_version ? " · saved version " + item.result_version : ""}`;
+      button.type = "button"; button.textContent = "View / review";
+      button.addEventListener("click", async () => {
+        closeUpload();
+        const current = context(), selection = uploadSelection;
+        try { const fresh = await api("/forecast-uploads/" + encodeURIComponent(item.id), {}, "json", current); if (uploadActive(current, selection)) showUpload(fresh); }
+        catch (error) { if (uploadActive(current, selection)) report(error, current); }
+      });
+      div.append(span, button); $("uploads").append(div);
+    });
+  }
+  $("forecast-file").addEventListener("change", () => { uploadRequestKey = null; });
+  $("upload-form").addEventListener("submit", async (event) => {
+    event.preventDefault(); if (uploadBusy || !uploadsAvailable) return;
+    const current = context(), file = $("forecast-file").files[0];
+    if (!file || !["application/pdf", "image/png", "image/jpeg"].includes(file.type) || file.size === 0 || file.size > (file.type === "application/pdf" ? 10 : 5) * 1024 * 1024) {
+      message("Choose a nonempty PDF up to 10 MB or PNG/JPEG up to 5 MB.", true); return;
+    }
+    uploadBusy = true; $("upload-submit").disabled = true; $("forecast-file").disabled = true;
+    uploadRequestKey = uploadRequestKey || crypto.randomUUID();
+    closeUpload();
+    const key = uploadRequestKey, selection = uploadSelection;
+    try {
+      const item = await api("/forecast-uploads", {method: "POST", headers: {"Content-Type": file.type, "Idempotency-Key": key}, body: file}, "json", current);
+      check(current); uploadRequestKey = null; $("forecast-file").value = "";
+      if (uploadActive(current, selection)) showUpload(item);
+      message("Upload queued. Refresh status after the worker runs; app uploads never send WhatsApp messages.");
+      await loadUploads(current);
+    } catch (error) { report(error, current); }
+    finally { if (active(current)) { uploadBusy = false; $("upload-submit").disabled = false; $("forecast-file").disabled = false; } }
+  });
+  $("refresh-uploads").addEventListener("click", async () => {
+    const current = context(), item = selectedUpload, selection = uploadSelection;
+    try {
+      await loadUploads(current); check(current);
+      if (item) { const fresh = await api("/forecast-uploads/" + encodeURIComponent(item.id), {}, "json", current); if (uploadActive(current, selection)) showUpload(fresh); }
+      await loadVersions(current);
+    } catch (error) { report(error, current); }
+  });
+  $("close-upload").addEventListener("click", closeUpload);
+  $("review-checked").addEventListener("change", () => { $("confirm-upload").disabled = !$("review-checked").checked || actionBusy; });
+  async function uploadAction(action) {
+    if (!selectedUpload || actionBusy || (action === "confirm" && !$("review-checked").checked)) return;
+    const current = context(), item = selectedUpload, selection = uploadSelection;
+    if (action === "cancel" && !window.confirm("Cancel this upload? No new roster will be generated from it.")) return;
+    actionBusy = true; ["confirm-upload", "cancel-upload", "regenerate-upload"].forEach((id) => { $(id).disabled = true; });
+    try {
+      const body = {expected_revision: item.revision};
+      if (action === "regenerate") body.request_key = crypto.randomUUID();
+      const fresh = await api(`/forecast-uploads/${encodeURIComponent(item.id)}/${action}`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)}, "json", current);
+      check(current); if (uploadActive(current, selection)) { showUpload(fresh); message(fresh.message); }
+      await loadUploads(current);
+    } catch (error) { if (uploadActive(current, selection)) report(error, current); }
+    finally {
+      if (active(current)) { actionBusy = false; if (selectedUpload) showUpload(selectedUpload); }
+    }
+  }
+  ["confirm", "cancel", "regenerate"].forEach((action) => $(action + "-upload").addEventListener("click", () => uploadAction(action)));
+  // Back/Forward cache must not retain a signed-in workspace or in-memory key.
+  window.addEventListener?.("pagehide", () => { clear(); message(""); });
   $("login-form").addEventListener("submit", async (event) => {
     event.preventDefault(); const entered = $("access-token").value; clear(); token = entered; const current = context();
     try { await reload(current); check(current); $("login").hidden = true; $("workspace").hidden = false; message("Connected to your shared saved hotel settings."); }
