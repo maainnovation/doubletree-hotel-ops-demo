@@ -147,6 +147,12 @@ class PrivateFileStore:
 class WorkflowStore(StateStore):
     development_only = True
 
+    @staticmethod
+    def _review_command(body):
+        if not isinstance(body,str) or len(body)>64:return None
+        match=re.fullmatch(r'(CONFIRM|CANCEL)\s+([0-9a-fA-F]{16})',body.strip(),re.I)
+        return {'type':'review_command','command':match.group(1).upper(),'review_code':match.group(2).lower()} if match else None
+
     def __init__(self, path=None):
         super().__init__(path)
         os.chmod(self.path, 0o600)
@@ -260,6 +266,9 @@ class WorkflowStore(StateStore):
                             continue
                         kind = message.get("type")
                         media = {"type": "unsupported"}
+                        if kind=='text':
+                            review=self._review_command(message.get('text',{}).get('body')) if isinstance(message.get('text'),dict) else None
+                            if review:media.update(review)
                         if kind in {"document", "image"}:
                             source = message.get(kind, {})
                             if not isinstance(source, dict):
@@ -285,7 +294,7 @@ class WorkflowStore(StateStore):
                             db.execute("UPDATE wa_senders SET last_inbound=MAX(last_inbound,?) WHERE phone_number_id=? AND sender=?", (min(timestamp, now), phone_id, sender))
         return accepted
 
-    def ingest_twilio(self, form, now: float, *, account_sid: str, business_sender: str, max_jobs=None) -> int:
+    def ingest_twilio(self, form, now: float, *, account_sid: str, business_sender: str, max_jobs=None, admission_hook=None) -> int:
         """Signed form envelope only. No fetch; receipt time never opens a send window.
 
         Twilio does not sign a timestamp. The worker must verify the immutable
@@ -307,10 +316,17 @@ class WorkflowStore(StateStore):
             enrolled = self._enrollment(db, phone_id, sender)
             if not enrolled:
                 return 0
-            if max_jobs is not None and not db.execute("SELECT 1 FROM wa_jobs WHERE phone_number_id=? AND message_id=?", (phone_id, message_id)).fetchone():
+            # An immutable provider message redelivery must not spend a new
+            # campaign intake slot or extend its customer-service window.
+            if db.execute("SELECT 1 FROM wa_jobs WHERE phone_number_id=? AND message_id=?", (phone_id, message_id)).fetchone():
+                return 0
+            if max_jobs is not None:
                 if not isinstance(max_jobs, int) or isinstance(max_jobs, bool) or not 1 <= max_jobs <= 100 or db.execute("SELECT COUNT(*) FROM wa_jobs").fetchone()[0] >= max_jobs:
                     raise ValueError("Pilot intake limit reached")
             media = {"type": "unsupported", "_provider": "twilio"}
+            if form.get('NumMedia')=='0':
+                review=self._review_command(form.get('Body'))
+                if review:media.update(review)
             if form.get("NumMedia") == "1":
                 url, mime = form.get("MediaUrl0", ""), form.get("MediaContentType0", "")
                 expected = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages/{message_id}/Media/"
@@ -324,7 +340,16 @@ class WorkflowStore(StateStore):
                 raise ValueError("Unexpected extra media")
             media["_enrolled_report_profile"] = enrolled["report_profile"]
             media["_enrollment_binding"] = self.enrollment_binding(enrolled)
-            return db.execute("INSERT OR IGNORE INTO wa_jobs(id,phone_number_id,message_id,sender,tenant_id,inbound_at,media_json,available_at) VALUES(?,?,?,?,?,?,?,?)", (uuid.uuid4().hex, phone_id, message_id, sender, enrolled["tenant_id"], now, json.dumps(media), now)).rowcount
+            job={"id":uuid.uuid4().hex,"phone_number_id":phone_id,"message_id":message_id,"sender":sender,
+                 "tenant_id":enrolled["tenant_id"],"inbound_at":now,"media_json":json.dumps(media),"available_at":now}
+            if admission_hook is not None:
+                if not callable(admission_hook):
+                    raise ValueError("Invalid admission policy")
+                db.row_factory=sqlite3.Row
+                if admission_hook(db,job,now) is not True:
+                    raise ValueError("Message is outside the explicitly approved intake scope")
+            return db.execute("INSERT INTO wa_jobs(id,phone_number_id,message_id,sender,tenant_id,inbound_at,media_json,available_at) VALUES(?,?,?,?,?,?,?,?)",
+                              tuple(job[key] for key in ("id","phone_number_id","message_id","sender","tenant_id","inbound_at","media_json","available_at"))).rowcount
 
     def twilio_status(self, form, now: float, *, account_sid: str, business_sender: str):
         """Signed callbacks reconcile known IDs only, never unknown/lost acknowledgements."""
@@ -384,9 +409,12 @@ class WorkflowStore(StateStore):
             exhausted = db.execute("SELECT * FROM wa_jobs WHERE status='processing' AND lease_until<? AND attempts>=5+ack_base_attempts AND (? IS NULL OR phone_number_id=?) AND (?=0 OR phone_number_id NOT LIKE 'twilio:%')", (now,phone_number_id,phone_number_id,exclude_twilio)).fetchall()
             for stale in exhausted:
                 ack = db.execute("SELECT status FROM wa_outbox WHERE job_id=? AND purpose='ack'", (stale['id'],)).fetchone()
-                if ack and ack['status'] in {'accepted','sent','delivered','read'}:
+                reviewed=False
+                if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='wa_forecast_reviews'").fetchone():
+                    reviewed=bool(db.execute("SELECT 1 FROM wa_forecast_reviews WHERE confirmed_job_id=? AND status='confirmed' AND tenant_id=? AND phone_number_id=? AND sender=?",(stale['id'],stale['tenant_id'],stale['phone_number_id'],stale['sender'])).fetchone())
+                if (ack and ack['status'] in {'accepted','sent','delivered','read'}) or reviewed:
                     if not db.execute("SELECT 1 FROM wa_outbox WHERE job_id=? AND purpose='result'", (stale['id'],)).fetchone():
-                        self.add_outbox(db, stale, now, "I received your PDF, but the automatic calculation could not be completed safely. Please review the app or contact the hotel administrator; no report will be sent automatically.")
+                        self.add_outbox(db, stale, now, "The confirmed forecast calculation could not be completed safely. Please resend for a new review or contact the hotel administrator; no report was generated." if reviewed else "I received your PDF, but the automatic calculation could not be completed safely. Please review the app or contact the hotel administrator; no report will be sent automatically.")
                     terminal = 'needs_correction'
                 else:
                     terminal = 'failed'

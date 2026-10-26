@@ -339,36 +339,114 @@ def parse_forecast_text(text: str) -> tuple[list[dict[str, Any]], list[str]]:
 
 
 def _extract_with_local_ocr(image, pytesseract) -> tuple[list[dict[str, Any]], list[str]]:
-    """Try table-row OCR first, then page-layout OCR if the first parse is incomplete.
+    """Produce a review-only candidate using at most four bounded local passes.
 
-    OCR remains review-only. A fallback is used only when it yields more parsed
-    dates or populated metric cells, and differing candidates are disclosed.
+    Preprocessing changes pixels, never recognized letters/numbers/dates. Once
+    a pass reads seven explicit dates, populated cells are not overwritten.
+    Blank cells can be supplied by another pass only when source-column dates
+    match exactly and all overlapping populated cells agree. Disagreement stops
+    merging and is disclosed; this is not an OCR accuracy/confidence guarantee.
     """
-    candidates = []
-    for config in ("--psm 6", "--psm 3"):
+    from PIL import Image, ImageOps
+
+    if image.width * image.height > 40_000_000:
+        raise ValueError("Image exceeds the 40 megapixel local OCR limit.")
+    baseline = None
+    original_rows = None
+    fallback = None
+    disagreement = False
+    recovered = False
+    additional_pass = False
+    timeout_seen = False
+    passes = (("original table", "--psm 6"), ("original page", "--psm 3"),
+              ("rescaled grayscale", "--psm 6"), ("rescaled threshold", "--psm 6"))
+    for index, (label, config) in enumerate(passes):
+        current = image
         try:
-            text = pytesseract.image_to_string(image, config=config)
-        except pytesseract.TesseractNotFoundError as exc:
-            raise ValueError("Local Tesseract OCR is not installed. Install tesseract-ocr and retry, or use manual entry.") from exc
-        except pytesseract.TesseractError as exc:
-            raise ValueError("Local Tesseract OCR could not process this image. Check the file or use manual entry.") from exc
+            if index >= 2:
+                # Resampling after a native PDF render avoids a second raster
+                # interpolation by the PDF renderer. Bound every image to 40 MP.
+                scale = min(1.5, math.sqrt(40_000_000 / (image.width * image.height)))
+                size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+                with ImageOps.grayscale(image) as gray:
+                    if index == 3:
+                        with gray.point(lambda value: 255 if value > 170 else 0) as threshold:
+                            current = threshold.resize(size, Image.Resampling.LANCZOS)
+                    else:
+                        current = gray.resize(size, Image.Resampling.LANCZOS)
+            try:
+                text = pytesseract.image_to_string(current, config=config, timeout=15)
+            except pytesseract.TesseractNotFoundError as exc:
+                raise ValueError("Local Tesseract OCR is not installed. Install tesseract-ocr and retry, or use manual entry.") from exc
+            except pytesseract.TesseractError as exc:
+                raise ValueError("Local Tesseract OCR could not process this image. Check the file or use manual entry.") from exc
+            except RuntimeError:
+                # pytesseract uses RuntimeError for its bounded-process timeout.
+                timeout_seen = True
+                continue
+        finally:
+            if current is not image:
+                current.close()
         rows, notices = parse_forecast_text(text)
+        source_dates, date_issues, _ = _date_tokens_from_text(text)
         date_count = sum(row.get("date") is not None for row in rows)
         cell_count = sum(row.get(field) is not None for row in rows for field in NUMERIC_FIELDS)
-        candidates.append(((date_count, cell_count), rows, notices, config))
-        # A full parse needs no alternate page segmentation pass.
-        if date_count == 7 and cell_count == 7 * len(NUMERIC_FIELDS):
-            return rows, notices
-
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    _, rows, notices, chosen_config = candidates[0]
-    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
-        first_values = [(row.get("date"), *(row.get(field) for field in NUMERIC_FIELDS)) for row in candidates[0][1]]
-        second_values = [(row.get("date"), *(row.get(field) for field in NUMERIC_FIELDS)) for row in candidates[1][1]]
-        if first_values != second_values:
-            notices.append("Local OCR layout modes disagree. Verify every displayed field before confirming.")
-    if chosen_config != "--psm 6":
-        notices.append("A second local OCR layout mode recovered more fields; verify every displayed value.")
+        candidate = {"rows": rows, "notices": notices, "source_dates": source_dates,
+                     "score": (date_count, cell_count), "pass_index": index}
+        if fallback is None or candidate["score"] > fallback["score"]:
+            fallback = candidate
+        if date_count != 7 or date_issues or len(set(source_dates)) != 7:
+            continue
+        if baseline is None:
+            baseline = candidate
+            baseline["rows"] = [dict(row) for row in rows]
+            original_rows = [dict(row) for row in rows]
+            additional_pass = index > 0
+        else:
+            if baseline["source_dates"] != source_dates:
+                disagreement = True
+                baseline["rows"] = [dict(row) for row in original_rows]
+                recovered = False
+                continue
+            conflicts = any(
+                left.get(field) is not None and right.get(field) is not None and left[field] != right[field]
+                for left, right in zip(baseline["rows"], rows) for field in NUMERIC_FIELDS
+            )
+            if conflicts:
+                disagreement = True
+                # Withdraw any earlier supplemental cells once observed evidence
+                # conflicts. Keep only the first explicitly dated pass for review.
+                baseline["rows"] = [dict(row) for row in original_rows]
+                recovered = False
+                continue
+            if not disagreement:
+                for left, right in zip(baseline["rows"], rows):
+                    for field in NUMERIC_FIELDS:
+                        if left.get(field) is None and right.get(field) is not None:
+                            left[field] = right[field]
+                            recovered = True
+                            additional_pass = True
+        if all(row.get(field) is not None for row in baseline["rows"] for field in NUMERIC_FIELDS):
+            break
+    chosen = baseline or fallback
+    if chosen is None:
+        raise ValueError("Local OCR exceeded its processing time limit. Try a clearer file or use manual entry.")
+    rows = chosen["rows"]
+    notices = list(chosen["notices"])
+    if recovered:
+        # Missing-field notices refer to an earlier pass, not the displayed
+        # multi-pass candidate. Keep the uncertainty explicit instead.
+        for field in NUMERIC_FIELDS:
+            if all(row.get(field) is not None for row in rows):
+                notice = f"Could not confidently extract all seven {field.replace('_', ' ')} values; enter them manually."
+                notices = [item for item in notices if item != notice]
+        notices.append("Blank cells were recovered from additional local OCR passes with matching printed dates and agreeing populated cells. All values remain unconfirmed; verify every cell.")
+    if disagreement:
+        notices.append("Local OCR layout modes disagree. Conflicting values were not overwritten; supplemental cells were withdrawn and further blank-cell merging was stopped; verify every displayed field before confirming.")
+    if additional_pass or chosen["pass_index"] > 0:
+        notices.append("Additional bounded local OCR preprocessing recovered more fields; this is not a confidence guarantee. Review every date and value.")
+    if timeout_seen:
+        notices.append("A local OCR pass reached its time limit; the displayed candidate still requires complete manual review.")
     return rows, notices
 
 
@@ -406,20 +484,29 @@ def extract_forecast_upload(filename: str, content: bytes) -> dict[str, Any]:
         try:
             document = pymupdf.open(stream=content, filetype="pdf")
             if len(document) > 10:
+                document.close()
                 raise ValueError("For this demo, scanned PDFs are limited to 10 pages.")
-            # A moderate render scale worked better than 2x on wide, compact
-            # roster/forecast tables in local OCR checks while bounding memory.
-            pages = [Image.open(BytesIO(page.get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5)).tobytes("png"))) for page in document]
+            for page in document:
+                if math.ceil(page.rect.width) * math.ceil(page.rect.height) > 40_000_000:
+                    document.close()
+                    raise ValueError("A scanned PDF page exceeds the 40 megapixel local OCR limit.")
         except pytesseract.TesseractNotFoundError as exc:
             raise ValueError("Local Tesseract OCR is not installed. Install tesseract-ocr and retry, or use manual entry.") from exc
         except pytesseract.TesseractError as exc:
             raise ValueError("Local Tesseract OCR could not process this scanned PDF. Check the file or use manual entry.") from exc
-        rows, notices = _extract_with_local_ocr(pages[0], pytesseract)
-        if len(pages) > 1:
-            for page_image in pages[1:]:
-                extra_rows, extra_notices = _extract_with_local_ocr(page_image, pytesseract)
-                if any(row.get("date") is not None for row in extra_rows):
+        # Render/process one native-resolution page at a time. The bounded
+        # local fallback resamples with PIL only when the first read is incomplete.
+        try:
+            for index, page in enumerate(document):
+                pixmap = page.get_pixmap(matrix=pymupdf.Matrix(1, 1), colorspace=pymupdf.csRGB, alpha=False)
+                with Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples) as page_image:
+                    page_rows, page_notices = _extract_with_local_ocr(page_image, pytesseract)
+                if index == 0:
+                    rows, notices = page_rows, page_notices
+                elif any(row.get("date") is not None for row in page_rows):
                     notices.append("More than one scanned page contains forecast-like dates; review the intended week manually.")
+        finally:
+            document.close()
         notices.insert(0, "Scanned PDF was OCR-processed locally with Tesseract. OCR may misread figures; verify every cell.")
         return {"rows": rows, "notices": notices, "method": "Local OCR (Tesseract)"}
     if suffix not in {"png", "jpg", "jpeg", "tif", "tiff", "webp"}:

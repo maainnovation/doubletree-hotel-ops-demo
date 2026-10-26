@@ -49,10 +49,10 @@ def stop_children(children, *, clock=time.monotonic, sleep=time.sleep, killpg=os
 
 
 def supervise(environment=None, *, popen=subprocess.Popen, clock=time.monotonic,
-              sleep=time.sleep, killpg=os.killpg, register_signal=signal.signal):
+              sleep=time.sleep, killpg=os.killpg, register_signal=signal.signal, command_factory=None):
     environment = dict(os.environ if environment is None else environment)
     try:
-        commands = child_commands(environment)
+        commands = (command_factory or child_commands)(environment)
     except ValueError:
         print("pilot_supervisor_invalid_port", file=sys.stderr, flush=True)
         return 2

@@ -1,0 +1,7 @@
+# Exact direct dependency versions exercised in the local Python 3.12.14 suite.
+# This is separate from the native-PDF rollback image. A built-image audit and
+# transitive dependency/image digest lock remain deployment gates.
+-r requirements-pilot.txt
+PyMuPDF==2.0
+pytesseract==0.3.13
+packaging==26.3

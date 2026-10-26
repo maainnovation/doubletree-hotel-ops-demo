@@ -1,0 +1,50 @@
+# Separate, initially disabled owner-review pilot; old Dockerfile.pilot unchanged.
+FROM python:3.12.14-slim-trixie
+
+ENV ORT_DISABLE_TELEMETRY=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    OMP_NUM_THREADS=1 \
+    OMP_THREAD_LIMIT=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
+    PORT=10000 \
+    PILOT_ENABLED=0 \
+    PILOT_REVIEW_ENABLED=0 \
+    PILOT_REVIEW_WHATSAPP_ENABLED=0 \
+    PILOT_REVIEW_RESOURCE_CONFIRMED=0 \
+    PILOT_REVIEW_RESOURCE_PROFILE=render_starter_512m \
+    PILOT_VOLUME_CONFIRMED=0 \
+    PILOT_DATA_ROOT=/var/data/whatsapp-review-pilot
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates tesseract-ocr tesseract-ocr-eng libseccomp2 \
+       fonts-dejavu-core fonts-liberation \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1000 pilot \
+    && useradd --uid 1000 --gid 1000 --create-home --shell /usr/sbin/nologin pilot \
+    && mkdir -p /var/data /app \
+    && chown 1000:1000 /var/data \
+    && chmod 0700 /var/data
+
+WORKDIR /app
+COPY requirements-pilot.txt requirements-review-pilot.txt ./
+RUN python -m pip install --no-cache-dir -r requirements-review-pilot.txt \
+    && python -m pip check \
+    && tesseract --version | head -n 1 | grep -qx 'tesseract 5.5.0' \
+    && tesseract --list-langs | grep -qx eng \
+    && python -c "import ctypes; ctypes.CDLL('libseccomp.so.2')"
+
+# Never COPY the whole repository, user inputs, workbook, .env, or local state.
+# These source trees remain root-owned and non-writable by the runtime account.
+COPY api ./api
+COPY services ./services
+COPY scripts ./scripts
+RUN chmod -R a-w /app
+
+USER 1000:1000
+EXPOSE 10000
+CMD ["python", "-m", "scripts.run_twilio_review_pilot"]

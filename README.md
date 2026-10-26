@@ -7,9 +7,13 @@ Mobile-first Streamlit demo with editable operating parameters, a separate AI ch
 A new signed webhook → durable job → strict forecast validation → versioned roster
 → PDF outbox workflow is implemented with **fake transport by default**. Run the
 [synthetic end-to-end demo and review production gates](docs/whatsapp_forecast_workflow.md).
-It is not connected to a live number. Native PDFs require an explicitly enrolled
+Repository defaults do not activate a live number. Native PDFs require an explicitly enrolled
 profile; the supported existing daily-table layout accepts its known labels and
-unambiguous full M/D/YYYY dates. Photos/scans still request correction. Parameters
+unambiguous full M/D/YYYY dates. The default narrow pilot rejects photos/scans.
+An opt-in, **local-only** [shared private app and PDF/photo review workflow](docs/whatsapp_review_workflow.md)
+adds isolated OCR, explicit sender-bound confirmation and authenticated access
+to the same saved Parameters, staff and roster store. It does not change the
+public Streamlit app or authorize general live uploads. Parameters
 now has a shared saved **Total rooms** field (292 for this built-in demo, per the
 user's latest instruction), used with the same saved cleaning standards by the
 WhatsApp worker; no separate enrollment capacity is maintained. The
