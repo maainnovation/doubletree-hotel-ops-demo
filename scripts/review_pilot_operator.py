@@ -23,6 +23,7 @@ import uuid
 import httpx
 
 from services.owner_review_runtime import legacy_config_from_environment
+from scripts.measure_review_runtime import resource_profile
 from services.review_pilot_cost import ReviewPilotCostMonitor, CostMonitorUnavailable
 from services.twilio_pilot import _persistent_mount
 from services.twilio_review_pilot import (_legacy_config, _open_existing, create_review_pilot_approval,
@@ -47,6 +48,10 @@ def _configuration(environment, require_key):
             or environment.get('PILOT_VOLUME_CONFIRMED')!='1'
             or environment.get('PILOT_REVIEW_RESOURCE_CONFIRMED')!='1'):
         raise OperatorDenied()
+    try:
+        resource_profile(environment)
+    except ValueError:
+        raise OperatorDenied() from None
     config=legacy_config_from_environment(environment)
     _legacy_config(config)
     if require_key:

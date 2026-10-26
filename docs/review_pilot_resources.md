@@ -60,7 +60,7 @@ No hotel file, enrollment, credential or database is used by this warmup.
   mode additionally keeps an API-resident copy, intentionally conservative.
 - Construct a new `CgroupMemoryGuard` for each assessment and pass it to
   `evaluate_forecast_media_isolated(..., memory_guard=guard)`. The guard requires
-  readable cgroup v2 evidence and a finite memory limit no greater than 512 MiB,
+  readable cgroup v2 evidence matching the selected allowlisted memory/CPU profile,
   at least 192 MiB free before request serialization and spawn, at least 64 MiB
   during evaluation, and unchanged OOM counters. Missing evidence denies work.
 - The isolated worker retains the **384 MiB per-process address-space cap**,
@@ -99,7 +99,7 @@ python -m scripts.measure_review_runtime --run-synthetic --mode local
 ```
 
 After an independently approved **disabled** staging deployment, run inside the
-existing 512 MiB / 0.5 CPU service:
+explicitly selected and approved service profile:
 
 ```sh
 python -m scripts.measure_review_runtime --run-synthetic --mode attached-disabled
@@ -124,7 +124,7 @@ Process-tree RSS is also reported but is explicitly diagnostic: it can double
 count shared pages and omits page cache. It is never used as aggregate proof.
 
 A measured-stage pass requires all four cases to finish, actual staged service
-processes, exactly 512 MiB cgroup limit, no more than 0.5 CPU, at least 64 MiB
+processes, the exact selected cgroup memory limit and CPU quota, at least 64 MiB
 aggregate measured margin, no OOM increments, and at least 128 MiB free temporary
 space. Fixture generation additionally requires 256 MiB free space beforehand,
 and the sampler stops work if less than 128 MiB remains. Missing cgroup evidence, a local-only run, failed/unsupported cases or
@@ -165,3 +165,27 @@ Docker-image regression remain required; no resource activation gate is waived.
 - [Debian Trixie Tesseract package](https://packages.debian.org/trixie/tesseract-ocr)
   supplies the 5.5.0 engine line used by the local OCR regression evidence;
   the older Bookworm package is not the tested engine.
+
+
+## Explicit host resource profiles
+
+`PILOT_REVIEW_RESOURCE_PROFILE` is an allowlist, not an arbitrary memory override:
+
+| Profile | Exact cgroup memory | Exact CPU quota |
+|---|---:|---:|
+| `render_starter_512m` (default) | 512 MiB | 0.5 |
+| `render_standard_2g` (requires explicit hosting approval) | 2048 MiB | 1.0 |
+
+Unknown values, missing cgroup evidence and a host/profile mismatch fail closed.
+Selecting a profile does not buy or change a service tier. Keep all intake flags
+0 and resource-confirmed0 while changing an approved tier, then configure the
+matching profile, deploy its tested source and run the same four-case warm probe.
+The report records the profile; sanitized probe children inherit only its validated
+name, never account credentials. The private API and worker use the same selected
+profile even when composed from an explicit environment mapping.
+
+The upgrade does **not** expand the isolated-child 384 MiB address-space cap,
+35-second deadline, upload/decoded-pixel limits, process count, 192 MiB admission
+reserve, 64 MiB running reserve, storage quotas or confirmation requirements.
+All cases, unchanged OOM counters, service continuity and disk gates must still
+pass. A larger host is not itself proof of resource qualification.

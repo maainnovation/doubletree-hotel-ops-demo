@@ -14,7 +14,7 @@ from services.forecast_media_worker import evaluate_forecast_media_isolated
 from services.review_pilot_cost import ReviewPilotCostMonitor
 from services.twilio_pilot import PilotConfig,PilotConfigurationError,TENANT,MANAGER
 from services.twilio_review_pilot import build_review_pilot_runtime, _fixtures
-from scripts.measure_review_runtime import CgroupMemoryGuard
+from scripts.measure_review_runtime import CgroupMemoryGuard, resource_profile
 
 
 _WARM_FIXTURES = None
@@ -68,6 +68,12 @@ def build_owner_components(environment=None,*,clock=time.time,transport=None,mem
         raise PilotConfigurationError('An operator-approved owner epoch and privately entered unique app key are required.')
     if transport is None and memory_guard_factory is not CgroupMemoryGuard:
         raise PilotConfigurationError('Live review requires the actual cgroup resource guard.')
+    try:
+        profile, _, _ = resource_profile(env)
+    except ValueError:
+        raise PilotConfigurationError('An allowlisted owner review resource profile is required.') from None
+    if memory_guard_factory is CgroupMemoryGuard:
+        memory_guard_factory = lambda: CgroupMemoryGuard(profile=profile)
     config=legacy_config_from_environment(env)
     if key in {config.auth_token,config.account_sid}:
         raise PilotConfigurationError('A distinct private owner app key is required.')

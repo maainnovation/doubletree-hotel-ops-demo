@@ -22,6 +22,11 @@ import time
 
 MIB = 1024 * 1024
 BUDGET_BYTES = 512 * MIB
+DEFAULT_RESOURCE_PROFILE = 'render_starter_512m'
+RESOURCE_PROFILES = {
+    DEFAULT_RESOURCE_PROFILE: (BUDGET_BYTES, 0.5),
+    'render_standard_2g': (2048 * MIB, 1.0),
+}
 SAFETY_MARGIN_BYTES = 64 * MIB
 # One API upload: retained chunks plus joined body, while a worker processes a
 # different report. API must reject a second upload before reading its body.
@@ -33,23 +38,34 @@ MAX_PROTOCOL_BYTES = 64 * 1024
 ADMISSION_HEADROOM_BYTES = 192 * MIB
 
 
+def resource_profile(environment=None, *, name=None):
+    """Only explicitly selected, reviewed host tiers; never arbitrary limits."""
+    env = os.environ if environment is None else environment
+    name = env.get('PILOT_REVIEW_RESOURCE_PROFILE', DEFAULT_RESOURCE_PROFILE) if name is None else name
+    if not isinstance(name, str) or name not in RESOURCE_PROFILES:
+        raise ValueError('An allowlisted owner review resource profile is required.')
+    memory, cpu = RESOURCE_PROFILES[name]
+    return name, memory, cpu
+
+
 class CgroupMemoryGuard:
     """Fail-closed admission/watchdog; not a hard descendant memory partition.
 
     Construct one per media evaluation. No network, secrets, writes or providers.
-    The outer service cgroup remains the hard 512 MiB ceiling; a sudden native
+    The selected service cgroup remains the hard aggregate ceiling; a sudden native
     allocation can outrun polling, so restart/unknown-send recovery is mandatory.
     """
-    def __init__(self, root=Path("/sys/fs/cgroup")):
+    def __init__(self, root=Path("/sys/fs/cgroup"), *, profile=None):
         self.root = Path(root)
         self.initial_oom = None
+        self.profile, self.memory_limit, self.cpu_cores = resource_profile(name=profile)
 
     def __call__(self, phase):
         state = cgroup_snapshot(self.root)
         if not isinstance(phase, str) or phase not in {"admission", "running"} or state is None:
             return False
         limit = state["maximum"]
-        if limit is None or not 0 < limit <= BUDGET_BYTES:
+        if limit != self.memory_limit or state['cpu_cores'] != self.cpu_cores:
             return False
         current_oom = (state["oom"], state["oom_kill"])
         if self.initial_oom is None:
@@ -174,6 +190,10 @@ def disabled_service_processes_present(proc_root=Path("/proc")):
 def qualification(report):
     """Conservative measured-staging gate, not a universal memory guarantee."""
     reasons = []
+    try:
+        profile, memory_limit, cpu_cores = resource_profile({'PILOT_REVIEW_RESOURCE_PROFILE': report.get('resource_profile', DEFAULT_RESOURCE_PROFILE)})
+    except ValueError:
+        return ['The measured resource profile is not allowlisted.']
     if report["mode"] != "attached-disabled" or not report["service_processes_present"]:
         reasons.append("Actual disabled API and worker were not observed; local diagnostic only.")
     if not report.get("service_continuity_verified", False):
@@ -182,10 +202,10 @@ def qualification(report):
     if first is None or last is None:
         reasons.append("Readable cgroup v2 memory/CPU/OOM evidence is unavailable.")
     else:
-        if first["maximum"] != BUDGET_BYTES or last["maximum"] != BUDGET_BYTES:
-            reasons.append("The measured cgroup was not constrained to exactly 512 MiB.")
-        if any(state["cpu_cores"] is None or not 0 < state["cpu_cores"] <= 0.5 for state in (first, last)):
-            reasons.append("The measured cgroup was not constrained to at most 0.5 CPU.")
+        if first["maximum"] != memory_limit or last["maximum"] != memory_limit:
+            reasons.append(f"The measured cgroup does not match the selected {memory_limit // MIB} MiB profile.")
+        if any(state["cpu_cores"] != cpu_cores for state in (first, last)):
+            reasons.append(f"The measured cgroup does not match the selected {cpu_cores:g} CPU profile.")
         if last["oom"] != first["oom"] or last["oom_kill"] != first["oom_kill"]:
             reasons.append("Cgroup OOM counters changed during the probe.")
         if any(type(state.get("historical_peak")) is not int or state["historical_peak"] <= 0 for state in (first, last)):
@@ -193,7 +213,7 @@ def qualification(report):
         elif last["historical_peak"] < first["historical_peak"]:
             reasons.append("Kernel memory.peak decreased; an intervening reset invalidates this measured gate.")
         peak = max(report["sampled_cgroup_peak_bytes"], last.get("historical_peak") or 0)
-        if peak > BUDGET_BYTES - SAFETY_MARGIN_BYTES:
+        if peak > memory_limit - SAFETY_MARGIN_BYTES:
             reasons.append("Measured aggregate memory lacks the required 64 MiB safety margin.")
     if report["minimum_free_temp_bytes"] < 128 * MIB:
         reasons.append("Less than 128 MiB of temporary filesystem space remained.")
@@ -217,8 +237,10 @@ def supported_case(case, assessment):
 
 def _safe_env(directory):
     from services.forecast_media_worker import _safe_environment
+    profile, _, _ = resource_profile()
     return dict(_safe_environment(str(directory)), PILOT_ENABLED="0", REVIEW_PILOT_ENABLED="0",
-                PILOT_REVIEW_ENABLED="0", PILOT_REVIEW_RESOURCE_CONFIRMED="0", PILOT_VOLUME_CONFIRMED="0")
+                PILOT_REVIEW_ENABLED="0", PILOT_REVIEW_RESOURCE_CONFIRMED="0", PILOT_VOLUME_CONFIRMED="0",
+                PILOT_REVIEW_RESOURCE_PROFILE=profile)
 
 
 def _command(*args):
@@ -311,10 +333,11 @@ def run_probe(mode, *, temp_parent=None, cgroup_root=Path("/sys/fs/cgroup")):
         raise ValueError("Choose a supported synthetic probe mode.")
     if any(os.getenv(name, "0") != "0" for name in ("PILOT_ENABLED", "PILOT_REVIEW_ENABLED", "REVIEW_PILOT_ENABLED")):
         raise ValueError("Disable the pilot before running the synthetic resource probe.")
+    profile, memory_limit, _ = resource_profile()
     reference = datetime.now(timezone.utc).isoformat()
     initial_service_identity = staged_service_identity()
     service_lost = False
-    report = {"synthetic_only": True, "mode": mode,
+    report = {"synthetic_only": True, "mode": mode, "resource_profile": profile,
               "service_processes_present": initial_service_identity is not None,
               "service_continuity_verified": False,
               "cgroup_before": cgroup_snapshot(cgroup_root), "cgroup_after": None,
@@ -339,7 +362,7 @@ def run_probe(mode, *, temp_parent=None, cgroup_root=Path("/sys/fs/cgroup")):
                 report["diagnostic_process_tree_rss_peak_bytes"], process_rss_bytes(process_tree(os.getpid())))
             report["minimum_free_temp_bytes"] = min(report["minimum_free_temp_bytes"], shutil.disk_usage(directory).free)
             return (service_lost or report["minimum_free_temp_bytes"] < 128 * MIB
-                    or (state is not None and state["current"] > BUDGET_BYTES - SAFETY_MARGIN_BYTES))
+                    or (state is not None and state["current"] > memory_limit - SAFETY_MARGIN_BYTES))
         def execute(arguments, deadline):
             with tempfile.TemporaryFile(dir=directory) as output:
                 env = dict(_safe_env(directory), REVIEW_RESOURCE_GUARD="1" if mode == "attached-disabled" else "0")

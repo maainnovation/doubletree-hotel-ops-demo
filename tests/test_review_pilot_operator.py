@@ -54,6 +54,7 @@ def test_backup_is_consistent_private_unique_and_preserves_every_old_ledger(owne
     {'PILOT_ENABLED':'1'},{'PILOT_REVIEW_ENABLED':'1'},{'PILOT_REVIEW_WHATSAPP_ENABLED':'1'},{'PILOT_VOLUME_CONFIRMED':'0'},
     {'PILOT_REVIEW_RESOURCE_CONFIRMED':'0'},{'PILOT_REVIEW_APP_KEY':''},{'PILOT_REVIEW_APP_KEY':'short'},
     {'PILOT_REVIEW_APP_KEY':'synthetic whitespace app key '+('x'*32)},
+    {'PILOT_REVIEW_RESOURCE_PROFILE':'custom_unbounded'},
 ])
 def test_activation_requires_disabled_flags_resource_gate_and_private_key(owner,change):
     values=disabled(owner);values.update(change);transport,calls=monitor_transport(owner)

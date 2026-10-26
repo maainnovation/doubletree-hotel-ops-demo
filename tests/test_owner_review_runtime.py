@@ -76,7 +76,7 @@ def test_default_disabled_without_any_config_and_private_auth_denied():
 
 
 @pytest.mark.parametrize('change',[{'PILOT_ENABLED':'1'},{'PILOT_REVIEW_RESOURCE_CONFIRMED':'0'},
- {'PILOT_REVIEW_APP_KEY':''},{'PILOT_REVIEW_APP_KEY':'bad key'}, {'PILOT_REVIEW_APP_KEY':ACCOUNT}, {'PILOT_REVIEW_APP_KEY':'x'*32+'\x00'}, {'PILOT_REVIEW_APPROVAL_ID':'../bad'}])
+ {'PILOT_REVIEW_APP_KEY':''},{'PILOT_REVIEW_APP_KEY':'bad key'}, {'PILOT_REVIEW_APP_KEY':ACCOUNT}, {'PILOT_REVIEW_APP_KEY':'x'*32+'\x00'}, {'PILOT_REVIEW_APPROVAL_ID':'../bad'}, {'PILOT_REVIEW_RESOURCE_PROFILE':'custom_unbounded'}])
 def test_missing_explicit_gates_fail_closed(composed,change):
     owner,c,client,environment=composed
     with pytest.raises(PilotConfigurationError):build_owner_components(environment|change,transport=owner['mock'],memory_guard_factory=AllowMemory)
@@ -86,6 +86,16 @@ def test_missing_explicit_gates_fail_closed(composed,change):
 def test_live_cannot_substitute_resource_guard(composed):
     _,_,_,environment=composed
     with pytest.raises(PilotConfigurationError):build_owner_components(environment,memory_guard_factory=AllowMemory)
+
+
+def test_owner_guard_uses_explicit_environment_profile_not_process_default(composed,monkeypatch):
+    owner,_,_,environment=composed
+    monkeypatch.delenv('PILOT_REVIEW_RESOURCE_PROFILE',raising=False)
+    c=build_owner_components(environment|{'PILOT_REVIEW_RESOURCE_PROFILE':'render_standard_2g'},
+        clock=lambda:owner['clock'][0],transport=owner['mock'])
+    guard=c.memory_guard_factory()
+    assert guard.profile=='render_standard_2g' and guard.memory_limit==2048*1024*1024 and guard.cpu_cores==1
+    assert not owner['state']['sends']
 
 
 def test_signed_pdf_ack_result_visible_in_same_private_app(composed):

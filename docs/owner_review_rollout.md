@@ -78,9 +78,12 @@ claim any prior payload was or was not transmitted; no such payload was captured
    changing the code branch/image. Existing masked credentials stay untouched.
 3. Deploy the verified `feature/forecast-input-validation` head using
    **`Dockerfile.review-pilot`**, context `.`, health `/health`, one instance,
-   existing 512 MiB/0.5 CPU plan and existing `/var/data` disk. Keep auto-deploy
+   explicitly approved allowlisted plan and existing `/var/data` disk. Keep auto-deploy
    off and the unchanged `PILOT_DATA_ROOT=/var/data/whatsapp-pilot`.
    Do not accept the Docker image's fallback data-root as a new state store.
+   Set `PILOT_REVIEW_RESOURCE_PROFILE=render_standard_2g` only for an explicitly
+   approved 2 GiB / 1 CPU host. The default `render_starter_512m` remains
+   512 MiB / 0.5 CPU; neither profile infers or purchases a hosting upgrade.
 4. Verify build `pip check`, Tesseract 5.5.0 English, libseccomp, nonroot UID1000,
    source tree non-writability, private-child0700, disk availability and disabled
    `/health`. Record resolved package versions; no live activation yet.
@@ -141,7 +144,8 @@ New variables (all access defaults deny):
 | `ORT_DISABLE_TELEMETRY` | Must be`1` before process startup; Docker forces default |
 | `PILOT_REVIEW_ENABLED` | `0` during stage; `1` for approved private-app epoch |
 | `PILOT_REVIEW_WHATSAPP_ENABLED` | Defaults`0`; separate intake/dispatch gate,`1` only after private app QA |
-| `PILOT_REVIEW_RESOURCE_CONFIRMED` | `1` only after measured512MiB gate |
+| `PILOT_REVIEW_RESOURCE_CONFIRMED` | `1` only after the selected profile's measured gate |
+| `PILOT_REVIEW_RESOURCE_PROFILE` | `render_starter_512m` default; explicitly approved `render_standard_2g` only |
 | `PILOT_REVIEW_APPROVAL_ID` | Explicit existing durable owner approval |
 | `PILOT_REVIEW_APP_KEY` | Explicitly authorized private key; never printed |
 

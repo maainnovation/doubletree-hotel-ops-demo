@@ -41,6 +41,55 @@ def test_finite_cgroup_snapshot_and_admission_vs_running_thresholds(tmp_path):
     assert not guard("running")
 
 
+@pytest.mark.parametrize('name,memory,cpu',[
+    ('render_starter_512m',512,0.5),('render_standard_2g',2048,1.0),
+])
+def test_allowlisted_profiles_match_exact_host_and_keep_reserves(tmp_path,name,memory,cpu):
+    options=dict(maximum=str(memory*resources.MIB),cpu=f'{int(cpu*100000)} 100000')
+    write_cgroup(tmp_path,current=memory-192,**options)
+    guard=resources.CgroupMemoryGuard(tmp_path,profile=name)
+    assert guard('admission')
+    write_cgroup(tmp_path,current=memory-191,**options)
+    assert not guard('admission') and guard('running')
+    write_cgroup(tmp_path,current=memory-64,**options)
+    assert guard('running')
+    write_cgroup(tmp_path,current=memory-63,**options)
+    assert not guard('running')
+    write_cgroup(tmp_path,current=memory-200,**(options|{'cpu':'25000 100000'}))
+    assert not guard('admission')
+
+
+@pytest.mark.parametrize('name',['','2048','render_standard_4g',' render_standard_2g',None,2048])
+def test_unknown_resource_profiles_never_choose_custom_limits(name):
+    with pytest.raises(ValueError):resources.resource_profile({'PILOT_REVIEW_RESOURCE_PROFILE':name})
+    report=passing_report();report['resource_profile']=name
+    assert resources.qualification(report)
+
+
+def test_larger_host_requires_explicit_matching_profile(tmp_path,monkeypatch):
+    monkeypatch.delenv('PILOT_REVIEW_RESOURCE_PROFILE',raising=False)
+    write_cgroup(tmp_path,maximum=str(2048*resources.MIB),cpu='100000 100000')
+    assert not resources.CgroupMemoryGuard(tmp_path)('admission')
+    monkeypatch.setenv('PILOT_REVIEW_RESOURCE_PROFILE','render_standard_2g')
+    assert resources.CgroupMemoryGuard(tmp_path)('admission')
+    assert resources._safe_env(tmp_path)['PILOT_REVIEW_RESOURCE_PROFILE']=='render_standard_2g'
+    report=passing_report();report['resource_profile']='render_standard_2g'
+    for side in ('cgroup_before','cgroup_after'):
+        report[side].update(maximum=2048*resources.MIB,cpu_cores=1)
+    assert resources.qualification(report)==[]
+    report['cgroup_after']['historical_peak']=1985*resources.MIB
+    assert any('64 MiB' in reason for reason in resources.qualification(report))
+
+
+def test_profile_does_not_expand_isolated_child_or_upload_limits():
+    from services import forecast_media_worker as worker
+    from services import forecast_media_review as media
+    assert worker.ADDRESS_SPACE_BYTES==384*resources.MIB
+    assert worker.WALL_TIMEOUT_SECONDS==35
+    assert worker.MAX_PDF_BYTES==10*resources.MIB and worker.MAX_IMAGE_BYTES==5*resources.MIB
+    assert media.MAX_SOURCE_IMAGE_PIXELS==12_000_000 and media.MAX_WORKING_PIXELS==4_000_000
+
+
 @pytest.mark.parametrize("maximum", ["max", "1073741824", "0", "garbled"])
 def test_guard_rejects_unbounded_wrong_or_invalid_container_limit(tmp_path, maximum):
     write_cgroup(tmp_path, maximum=maximum)
