@@ -263,8 +263,8 @@ def validate_whatsapp_forecast(
     hotel_code: str,
     room_capacity: int,
     now: datetime,
-    max_week_age_days: int = 7,
-    max_week_future_days: int = 56,
+    max_week_age_days: int | None = None,
+    max_week_future_days: int | None = None,
     *,
     report_profile: str = "canonical_v1",
     hotel_name: str | None = None,
@@ -285,8 +285,8 @@ def validate_whatsapp_forecast(
         raise ForecastNeedsCorrection("The enrolled hotel code is not configured correctly. Please contact the administrator.")
     if isinstance(room_capacity, bool) or not isinstance(room_capacity, int) or not 1 <= room_capacity <= 100_000:
         raise ForecastNeedsCorrection("The enrolled hotel room capacity is not configured correctly. Please contact the administrator.")
-    if not isinstance(now, datetime) or min(max_week_age_days, max_week_future_days) < 0:
-        raise ValueError("A valid current datetime and nonnegative week bounds are required.")
+    if not isinstance(now, datetime) or any(value is not None and (type(value) is not int or value < 0) for value in (max_week_age_days,max_week_future_days)):
+        raise ValueError("A valid current datetime and optional nonnegative week bounds are required.")
     if mime_type not in {"application/pdf", "image/png", "image/jpeg"}:
         raise ForecastNeedsCorrection("Please send a PDF, PNG or JPEG forecast attachment. Automatic scheduling currently requires the native-text PDF.")
     if not isinstance(data, bytes) or not data:
@@ -303,7 +303,7 @@ def validate_whatsapp_forecast(
                                              report_profile=report_profile,hotel_name=hotel_name)
 
 
-def _validate_extracted_forecast_text(text,hotel_code,room_capacity,now,max_week_age_days=7,max_week_future_days=56,
+def _validate_extracted_forecast_text(text,hotel_code,room_capacity,now,max_week_age_days=None,max_week_future_days=None,
                                     *,report_profile='canonical_v1',hotel_name=None):
     """Shared text checks; OCR callers must still require human source review."""
     if report_profile == "canonical_v1":
@@ -320,15 +320,17 @@ def _validate_extracted_forecast_text(text,hotel_code,room_capacity,now,max_week
     return validate_confirmed_forecast_rows(rows,room_capacity,now,max_week_age_days,max_week_future_days)
 
 
-def validate_confirmed_forecast_rows(rows,room_capacity,now,max_week_age_days=7,max_week_future_days=56):
+def validate_confirmed_forecast_rows(rows,room_capacity,now,max_week_age_days=None,max_week_future_days=None):
     """Recheck an explicit human-reviewed matrix against current saved limits.
 
     Confirmation never authorizes missing counts, arithmetic errors, impossible
-    inventory or a stale week. Callers separately bind source/enrollment/revision.
+    inventory. Historical/future report weeks retain their actual dates by
+    default; optional explicit caller bounds are separate from campaign,
+    review and provider-message expiries. No clock or approval is backdated.
     """
     from datetime import date
     if (type(room_capacity) is not int or not 1<=room_capacity<=100_000 or not isinstance(now,datetime)
-            or any(type(value) is not int or value<0 for value in (max_week_age_days,max_week_future_days))):
+            or any(value is not None and (type(value) is not int or value<0) for value in (max_week_age_days,max_week_future_days))):
         raise ValueError('A saved capacity and reference clock are required')
     if (not isinstance(rows,list) or len(rows)!=7 or any(not isinstance(row,dict) for row in rows)
             or any(type(row.get(field)) not in {int,float} for row in rows for field in NUMERIC_FIELDS)
@@ -342,8 +344,9 @@ def validate_confirmed_forecast_rows(rows,room_capacity,now,max_week_age_days=7,
 
     start = date.fromisoformat(normalized[0]["date"])
     today = now.date()
-    if not today - timedelta(days=max_week_age_days) <= start <= today + timedelta(days=max_week_future_days):
-        raise ForecastNeedsCorrection("The forecast week is outside the permitted current/upcoming range. Please resend the correct Friday-Thursday forecast.")
+    if ((max_week_age_days is not None and start < today-timedelta(days=max_week_age_days))
+            or (max_week_future_days is not None and start > today+timedelta(days=max_week_future_days))):
+        raise ForecastNeedsCorrection(f"The report's dates were read as {start.isoformat()} to {normalized[-1]['date']}, but its week is outside the explicitly configured date range. Dates are not changed automatically.")
     for row in normalized:
         if any(row[field] > room_capacity for field in NUMERIC_FIELDS if field != "occupancy_pct"):
             raise ForecastNeedsCorrection(f"{row['date']}: a room count exceeds the enrolled hotel's room capacity. Please correct and resend the forecast.")

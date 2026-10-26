@@ -328,19 +328,16 @@ def test_private_settings_edits_before_native_upload_are_used_without_duplicate_
     assert roster["input_snapshot"]["settings"]["hotel_inventory"]["room_capacity"] == 292
 
 
-@pytest.mark.parametrize("change", ["review_expired", "sender_revoked", "tenant_revoked", "stale_native"])
-def test_expired_revoked_or_stale_inputs_never_produce_roster(shared, change):
-    if change == "stale_native":
-        signed(shared, incoming(shared, "SM" + "9" * 32, data=STALE_SOURCE))
+@pytest.mark.parametrize("change", ["review_expired", "sender_revoked", "tenant_revoked"])
+def test_expired_review_or_revoked_access_never_produces_roster(shared, change):
+    code = image_prompt(shared)
+    if change == "review_expired":
+        shared["clock"][0] += 1801
     else:
-        code = image_prompt(shared)
-        if change == "review_expired":
-            shared["clock"][0] += 1801
-        else:
-            with shared["store"]._connect() as db:
-                db.execute("UPDATE wa_senders SET enabled=0 WHERE sender=?" if change == "sender_revoked" else "UPDATE wa_tenants SET enabled=0 WHERE tenant_id=?",
-                    (SENDER if change == "sender_revoked" else "hotel-a",))
-        signed(shared, incoming(shared, "SM" + "a" * 32, body="CONFIRM " + code))
+        with shared["store"]._connect() as db:
+            db.execute("UPDATE wa_senders SET enabled=0 WHERE sender=?" if change == "sender_revoked" else "UPDATE wa_tenants SET enabled=0 WHERE tenant_id=?",
+                (SENDER if change == "sender_revoked" else "hotel-a",))
+    signed(shared, incoming(shared, "SM" + "a" * 32, body="CONFIRM " + code))
     shared["worker"].drain_ready(); shared["worker"].drain_ready()
     assert not shared["store"].list_weekly_roster_versions("manager-a")
     assert not any(sent["type"] == "document" for sent in shared["provider"].sent)

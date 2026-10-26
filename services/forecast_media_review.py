@@ -42,10 +42,23 @@ def _candidate(text,context):
             return rows,[]
         except ForecastNeedsCorrection as exc:
             # Keep a complete transcription for human review while preserving
-            # current-week/capacity/arithmetic rejection. Never silently redate.
+            # capacity/arithmetic rejection. Never silently redate.
             return rows,[str(exc)]
     except ForecastNeedsCorrection as exc:
         return [],[str(exc)]
+
+
+def _review_candidate(text, context):
+    rows, issues = _candidate(text, context)
+    if rows or context['report_profile'] != 'hotel_daily_table_v1':
+        return rows, issues, None
+    from services.forecast_layout_review import normalize_known_review_layout
+    try:
+        normalized, adapter = normalize_known_review_layout(text, context['hotel_code'], context['hotel_name'], context['report_profile'])
+    except ForecastNeedsCorrection:
+        return rows, issues, None
+    rows, issues = _candidate(normalized, dict(context, report_profile='canonical_v1'))
+    return rows, issues, adapter
 
 
 def _ocr_image(data,mime_type):
@@ -137,8 +150,8 @@ def evaluate_forecast_media(data,mime_type,hotel_code,room_capacity,now,*,report
     """Return complete candidates and admission evidence without saving a roster.
 
     Capacity/profile/identity must come from trusted saved Parameters/enrollment.
-    The caller chooses an explicit reference clock for historical evaluation;
-    this never changes the worker's live date window. OCR is ALWAYS review-only.
+    Historical/future report dates are preserved; the real clock still governs
+    workflow approvals and confirmation expiry. OCR is ALWAYS review-only.
     """
     if (not isinstance(report_profile,str) or report_profile not in SUPPORTED_REPORT_PROFILES or not isinstance(hotel_code,str)
             or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',hotel_code)
@@ -160,7 +173,12 @@ def evaluate_forecast_media(data,mime_type,hotel_code,room_capacity,now,*,report
         try:text=_native_pdf_text(data)
         except ForecastOCRRequired:scanned=True
         else:
-            rows,issues=_candidate(text,context)
+            rows,issues,adapter=_review_candidate(text,context)
+            if adapter:
+                result.update(method='native_layout_review',rows=rows,issues=issues,
+                              status='needs_review' if rows and not issues else 'needs_correction',
+                              candidate_valid_for_confirmation=bool(rows and not issues),layout_adapter=adapter)
+                return result
             result.update(method='native_pdf',rows=rows,issues=issues,
                           status='eligible' if rows and not issues else 'needs_correction',
                           automatic_roster_allowed=bool(rows and not issues),requires_review=not bool(rows and not issues))
@@ -173,7 +191,8 @@ def evaluate_forecast_media(data,mime_type,hotel_code,room_capacity,now,*,report
     candidates=[]; all_issues=[]
     for evidence in passes:
         text=evidence.pop('text')
-        rows,issues=_candidate(text,context) if text else ([],[evidence.get('issue','Local OCR did not return usable text.')])
+        rows,issues,adapter=_review_candidate(text,context) if text else ([],[evidence.get('issue','Local OCR did not return usable text.')],None)
+        if adapter:evidence['layout_adapter']=adapter
         evidence['complete_cells']=sum(row.get(field) is not None for row in rows for field in NUMERIC_FIELDS)
         evidence['complete_dates']=len(rows)
         evidence['validation_issues']=issues

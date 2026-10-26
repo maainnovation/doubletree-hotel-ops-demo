@@ -140,7 +140,11 @@ class ForecastWorker:
                     # No OCR evidence, confidence, or agreement may authorize
                     # automatic scheduling. A complete matrix needs consent.
                     if assessment.get('candidate_valid_for_confirmation') is not True or not assessment.get('rows'):
-                        raise ForecastNeedsCorrection('A complete, current and internally consistent report could not be extracted for confirmation. Resend a sharper full report or its original native-text PDF; missing dates or counts will not be guessed.')
+                        if isinstance(assessment.get('rows'),list) and len(assessment['rows'])==7:
+                            # Recompute safe matrix/date diagnostics locally;
+                            # never echo arbitrary child/source issue strings.
+                            validate_confirmed_forecast_rows(assessment['rows'],capacity,datetime.fromtimestamp(now,timezone.utc))
+                        raise ForecastNeedsCorrection('A complete and internally consistent report could not be extracted for confirmation. Resend a sharper full report or its original native-text PDF; missing dates or counts will not be guessed. Historical report dates are allowed and preserved.')
                     source_key=self.files.put(job['tenant_id'],data,suffix)
                     self.review_service.stage(job,assessment['rows'],source_hash,source_key,media['mime'],saved_settings,now)
                     return True

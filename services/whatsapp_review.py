@@ -62,7 +62,7 @@ def _validated_rows(rows, capacity, now):
 
 
 def _prompt(rows, code, expires_at):
-    lines = ["Review OCR against your ORIGINAL file. No roster has been calculated.",
+    lines = ["Review extracted figures against your ORIGINAL file. No roster has been calculated.",
              "Each date: Departures / Stayovers / Arrivals / Rooms on books / Forecast pickup / Forecast occupied / Occupancy %"]
     for row in rows:
         values = [str(row[field]) if field != "occupancy_pct" else str(row[field]).removesuffix(".0") for field in _FIELDS]

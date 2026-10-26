@@ -138,10 +138,24 @@ def test_duplicate_metric_rejects():
         admit(pdf_bytes(lines))
 
 
-@pytest.mark.parametrize("start", [date(2026, 10, 24), date(2026, 10, 16), date(2026, 12, 25)])
-def test_wrong_weekday_stale_and_distant_weeks_reject(start):
+@pytest.mark.parametrize("start", [date(2026, 10, 24)])
+def test_wrong_weekday_still_rejects(start):
     with pytest.raises(ForecastNeedsCorrection):
         admit(pdf_bytes(report_lines(start=start)))
+
+
+@pytest.mark.parametrize('start',[date(2025,10,24),date(2026,10,16),date(2026,12,25),date(2030,10,25)])
+def test_historical_and_future_report_weeks_keep_actual_dates(start):
+    rows=admit(pdf_bytes(report_lines(start=start)))
+    assert rows[0]['date']==start.isoformat()
+    assert rows[-1]['date']==(start+timedelta(days=6)).isoformat()
+
+
+def test_explicit_optional_date_bounds_remain_available_without_changing_defaults():
+    source=pdf_bytes(report_lines(start=date(2025,10,24)))
+    assert admit(source)
+    with pytest.raises(ForecastNeedsCorrection,match='explicitly configured date range'):
+        admit(source,max_week_age_days=7,max_week_future_days=56)
 
 
 def test_missing_duplicate_and_ambiguous_dates_reject():

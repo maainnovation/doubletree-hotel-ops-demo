@@ -95,15 +95,17 @@ def test_unrecognized_identity_dates_cells_or_instructions_do_not_make_a_candida
     assert not result['rows'] and not result['automatic_roster_allowed']
 
 
-def test_historical_evaluation_never_silently_redates_or_widens_current_window(monkeypatch):
+def test_historical_evaluation_preserves_dates_and_ocr_confirmation_policy(monkeypatch):
     text='\n'.join(report_lines())
     mock_passes(monkeypatch,text)
     future=datetime(2026,12,1,tzinfo=timezone.utc)
     for data,mime in [(pdf_bytes(),'application/pdf'),(image_bytes(),'image/png')]:
         result=evaluate(data,mime,now=future)
         assert result['rows'][0]['date']=='2026-10-23'
-        assert any('outside the permitted' in issue for issue in result['issues'])
-        assert not result['automatic_roster_allowed']
+        assert not any('outside' in issue for issue in result['issues'])
+        assert result['automatic_roster_allowed'] is (mime=='application/pdf')
+        if mime!='application/pdf':
+            assert result['candidate_valid_for_confirmation'] and result['requires_review']
 
 
 def test_known_daily_profile_still_needs_explicit_enrollment(monkeypatch):

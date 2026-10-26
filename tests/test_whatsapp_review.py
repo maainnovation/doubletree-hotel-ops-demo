@@ -244,14 +244,11 @@ def test_stage_respects_nearly_closed_original_window(env):
     assert query(env,'SELECT expires_at FROM wa_forecast_reviews')[0]['expires_at'] == now+100
 
 
-@pytest.mark.parametrize('alteration', ['missing', 'duplicate_date', 'old_week', 'capacity', 'arithmetic', 'boolean', 'nan', 'partial', 'pct_precision', 'prior_day'])
+@pytest.mark.parametrize('alteration', ['missing', 'duplicate_date', 'capacity', 'arithmetic', 'boolean', 'nan', 'partial', 'pct_precision', 'prior_day'])
 def test_incomplete_or_invalid_candidate_never_creates_prompt(env, alteration):
     rows = deepcopy(env['rows'])
     if alteration == 'missing': del rows[0]['departures']
     elif alteration == 'duplicate_date': rows[1]['date'] = rows[0]['date']
-    elif alteration == 'old_week':
-        from datetime import date
-        for row in rows: row['date'] = (date.fromisoformat(row['date']) - timedelta(days=28)).isoformat()
     elif alteration == 'capacity': rows[0]['departures'] = 401
     elif alteration == 'arithmetic': rows[0]['rooms_on_books'] = 99
     elif alteration == 'boolean': rows[0]['departures'] = True
@@ -262,6 +259,21 @@ def test_incomplete_or_invalid_candidate_never_creates_prompt(env, alteration):
     with pytest.raises(ForecastNeedsCorrection): stage(env, rows=rows)
     assert not query(env, 'SELECT * FROM wa_forecast_reviews')
     assert not query(env, 'SELECT * FROM wa_outbox')
+
+
+def test_historical_week_keeps_source_bound_prompt_and_real_review_expiry(env):
+    from datetime import date
+    rows=deepcopy(env['rows'])
+    for row in rows:row['date']=(date.fromisoformat(row['date'])-timedelta(days=28)).isoformat()
+    job,result=stage(env,rows=rows)
+    assert result['status']=='awaiting_review'
+    review=query(env,'SELECT * FROM wa_forecast_reviews')[0]
+    assert review['original_job_id']==job['id']
+    assert review['source_hash']==hashlib.sha256(env['data']).hexdigest()
+    assert review['expires_at']==env['now']+1800
+    prompt=query(env,'SELECT * FROM wa_outbox')[0]['text']
+    assert rows[0]['date'] in prompt and 'Review extracted figures' in prompt
+    assert not env['store'].list_weekly_roster_versions('review-gm')
 
 
 def test_same_content_reupload_and_same_message_do_not_repeat_prompt(env):

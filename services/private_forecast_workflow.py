@@ -35,10 +35,10 @@ MESSAGES = {
     "calculating": "Calculating with the reviewed saved settings and existing locks.",
     "calculated": "A new roster version is saved. Review it before operational use.",
     "needs_attention": "A new version is saved, but shortages or constraints remain. It is not a confirmed workable schedule.",
-    "needs_correction": "A complete, current, internally consistent forecast could not be extracted. Resend a clearer full report or original PDF; missing values are never guessed.",
+    "needs_correction": "A complete, internally consistent forecast could not be extracted. Resend a clearer full report or original PDF; missing values are never guessed. Historical report dates are allowed and preserved.",
     "stale": "Settings, hotel mapping, or the saved roster changed. Request a fresh review before calculating.",
     "cancelled": "Cancelled. This upload will not generate a roster.",
-    "expired": "The review or source expired. Upload the complete current report again.",
+    "expired": "The review or source expired. Upload the complete report again; its original dates will be preserved.",
     "failed": "Processing could not complete safely. No automatic retry was made; upload again or request a fresh review.",
     "blocked": "Owner approval or the synthetic hotel setup is no longer active.",
     "storage_blocked": "Private storage quota or safety limit reached. Contact the operator; do not repeatedly resend the file.",
@@ -116,7 +116,9 @@ class PrivateForecastWorkflow:
     def _view(row):
         result = {key: row[key] for key in ("id", "status", "revision", "created_at", "expires_at", "review_expires_at", "settings_revision", "week_start", "result_version", "method")}
         result["message"] = MESSAGES[row["status"]]
-        if row["status"] == "needs_review" and row["method"] != "native_pdf":
+        if row["status"] == "needs_review" and row["method"] == "native_layout_review":
+            result["message"] += " This alternate PDF layout was normalized for review only. Verify every source column and value before confirming."
+        elif row["status"] == "needs_review" and row["method"] != "native_pdf":
             result["message"] += " Photo/scanned-PDF OCR can misread digits even when checks agree. Cancel and resend if any value differs from the original."
         result["rows"] = json.loads(row["candidate_json"]) if row["status"] == "needs_review" and row["candidate_json"] else []
         return result
@@ -259,6 +261,8 @@ class PrivateForecastWorkflow:
                 assessment = evaluator(data, job["mime"], binding["hotel_code"], capacity, datetime.fromtimestamp(now, timezone.utc), report_profile=binding["report_profile"], hotel_name=binding["hotel_name"])
                 valid = isinstance(assessment, dict) and (assessment.get("candidate_valid_for_confirmation") is True or (assessment.get("method") == "native_pdf" and assessment.get("automatic_roster_allowed") is True and assessment.get("requires_review") is False))
                 if not valid:
+                    if isinstance(assessment,dict) and isinstance(assessment.get('rows'),list) and len(assessment['rows'])==7:
+                        validate_confirmed_forecast_rows(assessment['rows'],capacity,datetime.fromtimestamp(now,timezone.utc))
                     raise ForecastNeedsCorrection("No complete candidate")
                 rows = validate_confirmed_forecast_rows(assessment.get("rows"), capacity, datetime.fromtimestamp(now, timezone.utc))
                 candidate = _json(rows)
@@ -279,7 +283,7 @@ class PrivateForecastWorkflow:
                 if stage == "extracting":
                     rows = validate_confirmed_forecast_rows(rows, capacity2, datetime.fromtimestamp(fresh, timezone.utc))
                     prior = db.execute("SELECT version FROM weekly_rosters WHERE manager_id=? AND week_start=?", (job["manager_id"], rows[0]["date"])).fetchone()
-                    method = assessment.get("method") if assessment.get("method") in {"native_pdf", "local_scanned_pdf_ocr", "local_image_ocr"} else "review"
+                    method = assessment.get("method") if assessment.get("method") in {"native_pdf", "native_layout_review", "local_scanned_pdf_ocr", "local_image_ocr"} else "review"
                     db.execute("UPDATE private_forecast_uploads SET status='needs_review',revision=revision+1,settings_revision=?,settings_hash=?,candidate_json=?,candidate_hash=?,method=?,week_start=?,prior_version=?,review_expires_at=?,claim_token=NULL,lease_until=NULL WHERE id=?", (revision, _hash(_json(staff).encode()), candidate, _hash(candidate.encode()), method, rows[0]["date"], prior[0] if prior else 0, min(current["expires_at"], fresh + REVIEW_SECONDS), job["id"]))
                 else:
                     self._check_snapshot(db, current, binding2, staff2, revision2)
