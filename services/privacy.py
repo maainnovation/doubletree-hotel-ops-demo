@@ -9,7 +9,7 @@ import sys
 
 
 def disable_dependency_telemetry():
-    if 'onnxruntime' in sys.modules and os.environ.get('ORT_DISABLE_TELEMETRY') != '1':
+    if sys.modules.get('onnxruntime') is not None and os.environ.get('ORT_DISABLE_TELEMETRY') != '1':
         raise RuntimeError('Restart the process with dependency telemetry disabled before native imports.')
     # Deliberately override an inherited opt-in: this application has no consent
     # to export optional OCR-library telemetry.

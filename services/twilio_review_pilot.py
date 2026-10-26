@@ -584,6 +584,13 @@ def _fixtures(week, report_profile):
     recompression changes bytes and is intentionally not guessed/whitelisted.
     The stored approval week is never silently advanced after activation.
     """
+    # Use the same native PDF rasterizer as the validated fixtures, but do not
+    # initialize its unused optional ONNX layout analyzer in API/worker startup.
+    # The isolated media worker uses the same optional-module exclusion.
+    import sys
+    if 'pymupdf' not in sys.modules:
+        for module in ('pymupdf.layout','pymupdf4llm','onnxruntime'):
+            sys.modules[module] = None
     import pymupdf
     if report_profile == 'canonical_v1':
         pdf = synthetic_forecast(week)

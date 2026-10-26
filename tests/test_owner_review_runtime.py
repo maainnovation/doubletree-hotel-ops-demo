@@ -261,3 +261,22 @@ def test_default_whatsapp_pause_allows_private_qa_but_no_intake_or_dispatch(comp
         assert response.status_code==202
         assert run_worker(paused,once=True)=={'processed':0,'dispatched':0,'app_processed':1}
         assert not owner['state']['sends'] and count(c,'pilot_review_attempts')==before
+
+
+def test_disabled_startup_warms_actual_fixture_dependencies_without_onnx(tmp_path):
+    import os,subprocess,sys,json
+    code="""import json,sys
+from services.forecast_media_worker import _install_network_denial
+_install_network_denial()
+from services.owner_review_runtime import build_owner_components,warm_owner_dependencies
+assert build_owner_components({}) is None
+from services import owner_review_runtime as owner
+before=id(owner._WARM_FIXTURES)
+warm_owner_dependencies()
+assert id(owner._WARM_FIXTURES)==before
+print(json.dumps({'profiles':len(owner._WARM_FIXTURES),'onnx':sys.modules.get('onnxruntime') is not None,'pymupdf':'pymupdf' in sys.modules}))
+"""
+    result=subprocess.run([sys.executable,'-c',code],env=dict(os.environ,ORT_DISABLE_TELEMETRY='1'),
+        capture_output=True,timeout=20)
+    assert result.returncode==0,result.stderr.decode()[:300]
+    assert json.loads(result.stdout)=={'profiles':2,'onnx':False,'pymupdf':True}

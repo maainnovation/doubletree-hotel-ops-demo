@@ -13,8 +13,22 @@ from services.private_forecast_workflow import PrivateForecastWorkflow
 from services.forecast_media_worker import evaluate_forecast_media_isolated
 from services.review_pilot_cost import ReviewPilotCostMonitor
 from services.twilio_pilot import PilotConfig,PilotConfigurationError,TENANT,MANAGER
-from services.twilio_review_pilot import build_review_pilot_runtime
+from services.twilio_review_pilot import build_review_pilot_runtime, _fixtures
 from scripts.measure_review_runtime import CgroupMemoryGuard
+
+
+_WARM_FIXTURES = None
+
+def warm_owner_dependencies():
+    """Include fixture/native-font startup in DISABLED service memory evidence.
+
+    Only fixed fictional bytes are retained. No environment, database, account,
+    source upload or network is accessed; never import the optional ONNX model.
+    """
+    global _WARM_FIXTURES
+    if _WARM_FIXTURES is None:
+        _WARM_FIXTURES = {profile:_fixtures(date(2026,10,23),profile)
+                          for profile in ('canonical_v1','hotel_daily_table_v1')}
 
 
 def legacy_config_from_environment(environment=None):
@@ -42,6 +56,7 @@ class OwnerComponents:
 
 
 def build_owner_components(environment=None,*,clock=time.time,transport=None,memory_guard_factory=CgroupMemoryGuard):
+    warm_owner_dependencies()
     env=os.environ if environment is None else environment
     if env.get('PILOT_REVIEW_ENABLED','0')!='1':return None
     if env.get('PILOT_ENABLED','0')!='0' or env.get('PILOT_REVIEW_RESOURCE_CONFIRMED')!='1':

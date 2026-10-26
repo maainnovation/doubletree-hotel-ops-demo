@@ -38,6 +38,14 @@ and the separately mounted 1 GiB private data disk are different resource budget
 
 ## Mandatory concurrency and memory contract
 
+Disabled API and worker startup now warm both fixed fictional fixture profiles
+through the same native rasterizer used after activation. Unused optional
+`pymupdf.layout`, `pymupdf4llm` and ONNX imports are excluded, as in the isolated
+media child; the documented telemetry opt-out remains enforced. The assessment
+harness also performs this warmup. Thus the disabled benchmark includes the
+long-lived fixture/font/native startup instead of an artificially cold service.
+No hotel file, enrollment, credential or database is used by this warmup.
+
 - Exactly **one API process**, no replicas. Upload admission takes a nonwaiting
   lock before reading the body; concurrent intake returns 429. Keep that lock
   through persistence and buffer release. Byte limits are 10 MiB PDF / 5 MiB

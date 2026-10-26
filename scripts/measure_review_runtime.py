@@ -287,6 +287,8 @@ def _child(operation, directory, case=None, reference=None):
             time.sleep(60)
     if operation == "--assess":
         importlib.import_module(WORKER_MODULE)
+        from services.owner_review_runtime import warm_owner_dependencies
+        warm_owner_dependencies()
         # In attached mode the real API is idle. Account conservatively for a
         # simultaneous maximum intake in this helper instead, without any HTTP.
         retained_upload = bytearray(UPLOAD_BUFFER_BYTES)
