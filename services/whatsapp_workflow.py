@@ -14,7 +14,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 
-from services.whatsapp_forecast import ForecastNeedsCorrection, validate_whatsapp_forecast
+from services.whatsapp_forecast import ForecastNeedsCorrection, validate_confirmed_forecast_rows, validate_whatsapp_forecast
 from services.whatsapp_provider import AmbiguousSendError, ProviderError, RetryableProviderError
 from services.twilio_provider import TwilioRequestRejected
 from services.weekly_roster import build_exports, generate_weekly_roster, is_roster_current
@@ -26,15 +26,25 @@ _ACK_ACCEPTED = {"accepted", "sent", "delivered", "read"}
 
 
 class ForecastWorker:
-    def __init__(self, store, files, provider, clock=time.time, *, acknowledge_uploads=False):
+    def __init__(self, store, files, provider, clock=time.time, *, acknowledge_uploads=False, review_images=False, media_evaluator=None):
+        if review_images and getattr(provider,'is_live',False):
+            raise ValueError('General photo/review workflow is local-only until its private deployment and sending scope are approved.')
         if getattr(provider, "is_live", False) and (getattr(store, "development_only", True) or getattr(files, "development_only", True)):
             from services.twilio_pilot import SyntheticPilotProvider
             if not isinstance(provider, SyntheticPilotProvider) or not provider.permits_development_storage(store, files):
                 raise ValueError("Live WhatsApp is blocked with development storage; approved production adapters are required")
         if not isinstance(acknowledge_uploads, bool):
             raise ValueError("Acknowledgement enable flag must be boolean")
+        if not isinstance(review_images,bool):
+            raise ValueError('Image review enable flag must be boolean')
         self.acknowledge_uploads = acknowledge_uploads
+        self.review_images=review_images
+        self.media_evaluator=media_evaluator
         self.store, self.files, self.provider, self.clock = store, files, provider, clock
+        self.review_service=None
+        if review_images:
+            from services.whatsapp_review import WhatsAppReviewService
+            self.review_service=WhatsAppReviewService(store,files)
 
     def process_one(self):
         now = self.clock()
@@ -73,6 +83,9 @@ class ForecastWorker:
                     db.execute("UPDATE wa_jobs SET inbound_at=? WHERE id=?", (inbound_at, job["id"]))
                     db.execute("UPDATE wa_senders SET last_inbound=MAX(last_inbound,?) WHERE phone_number_id=? AND sender=?", (min(inbound_at, now), job["phone_number_id"], job["sender"]))
                 job["inbound_at"] = inbound_at
+            if media['type']=='review_command':
+                self._handle_review_command(job,media,now)
+                return True
             if media["type"] == "unsupported":
                 self._correction(job, "Please send the complete standard native-text forecast PDF, including Hotel code, all seven Friday–Thursday dates and all forecast counts. Photos/scans need review; no roster was changed.")
                 return True
@@ -95,8 +108,42 @@ class ForecastWorker:
             if not job["phone_number_id"].startswith("twilio:") and not hmac.compare_digest(actual_hash, base64.b64decode(media["sha256"], validate=True)):
                 raise ForecastNeedsCorrection("The uploaded file failed its integrity check. Please resend the original PDF.")
             source_hash = actual_hash.hex()
-            rows = validate_whatsapp_forecast(data, media["mime"], enrolled["hotel_code"], capacity, datetime.fromtimestamp(now, timezone.utc), report_profile=enrolled["report_profile"], hotel_name=enrolled["hotel_name"])
-            source_key = self.files.put(job["tenant_id"], data, "pdf")
+            suffix={'application/pdf':'pdf','image/png':'png','image/jpeg':'jpg'}[media['mime']]
+            if self.review_images:
+                # Even the first PDF text/stream inspection must run inside
+                # resource isolation: decompression precedes OCR classification.
+                evaluator=self.media_evaluator
+                if evaluator is None:
+                    from services.forecast_media_worker import evaluate_forecast_media_isolated
+                    evaluator=evaluate_forecast_media_isolated
+                try:
+                    assessment=evaluator(data,media['mime'],enrolled['hotel_code'],capacity,datetime.fromtimestamp(now,timezone.utc),
+                                         report_profile=enrolled['report_profile'],hotel_name=enrolled['hotel_name'])
+                except ForecastNeedsCorrection:
+                    raise
+                except Exception:
+                    raise ForecastNeedsCorrection('Local image/PDF review could not complete within its safety limits. Resend a sharper, smaller report or the original native-text PDF.') from None
+                if not isinstance(assessment,dict):
+                    raise ForecastNeedsCorrection('The report could not be assessed safely. Please resend its original native-text PDF.')
+                native_automatic=(media['mime']=='application/pdf'
+                                  and assessment.get('method')=='native_pdf'
+                                  and assessment.get('automatic_roster_allowed') is True
+                                  and assessment.get('requires_review') is False)
+                if native_automatic:
+                    # Cheap matrix checks only; no PDF decoding in the worker.
+                    rows=validate_confirmed_forecast_rows(assessment.get('rows'),capacity,datetime.fromtimestamp(now,timezone.utc))
+                else:
+                    # No OCR evidence, confidence, or agreement may authorize
+                    # automatic scheduling. A complete matrix needs consent.
+                    if assessment.get('candidate_valid_for_confirmation') is not True or not assessment.get('rows'):
+                        raise ForecastNeedsCorrection('A complete, current and internally consistent report could not be extracted for confirmation. Resend a sharper full report or its original native-text PDF; missing dates or counts will not be guessed.')
+                    source_key=self.files.put(job['tenant_id'],data,suffix)
+                    self.review_service.stage(job,assessment['rows'],source_hash,source_key,media['mime'],saved_settings,now)
+                    return True
+            else:
+                rows=validate_whatsapp_forecast(data,media['mime'],enrolled['hotel_code'],capacity,datetime.fromtimestamp(now,timezone.utc),
+                                               report_profile=enrolled['report_profile'],hotel_name=enrolled['hotel_name'])
+            source_key = self.files.put(job["tenant_id"], data, suffix)
             with self.store._connect() as db:
                 already_staged = db.execute("SELECT 1 FROM wa_outbox WHERE job_id=? AND purpose='ack'", (job['id'],)).fetchone()
             if self.acknowledge_uploads or already_staged:
@@ -116,6 +163,27 @@ class ForecastWorker:
             if not self._terminal_ack_failure(job):
                 self.store.job_failed(job, now, "processing_error")
         return True
+
+    def _handle_review_command(self,job,media,now):
+        if not self.review_images:
+            self.store.job_failed(job,now,'review_disabled',retry=False)
+            return
+        result=self.review_service.resolve(job,media['command'],media['review_code'],now)
+        status=result['status']
+        if status=='ready':
+            enrolled=self.store.enrollment(job['phone_number_id'],job['sender'])
+            self._persist_roster(job,enrolled,result['rows'],result['source_hash'],result['source_key'],result['settings_revision'])
+        elif status=='duplicate':
+            with self.store._connect() as db:
+                if self._owns_job(db,job):
+                    db.execute("UPDATE wa_jobs SET status='duplicate',error_code='review_already_resolved',lease_until=NULL WHERE id=?",(job['id'],))
+        else:
+            messages={
+                'cancelled':'Review cancelled. No roster was generated from that upload.',
+                'expired':'That review expired. Please resend the complete current forecast for a new review.',
+                'settings_changed':'Saved Parameters, staff or hotel enrollment changed. Please resend the report so the review uses the latest saved setup.',
+            }
+            self._correction(job,messages.get(status,'That review could not be confirmed safely. Please resend the complete current report; no roster was changed.'))
 
     def _correction(self, job, text):
         now = self.clock()
@@ -139,9 +207,12 @@ class ForecastWorker:
             return False
         with self.store._connect() as db:
             ack = db.execute("SELECT status FROM wa_outbox WHERE job_id=? AND purpose='ack'", (job['id'],)).fetchone()
-        if not ack or ack[0] not in _ACK_ACCEPTED:
+            reviewed=False
+            if self.review_service is not None:
+                reviewed=bool(db.execute("SELECT 1 FROM wa_forecast_reviews WHERE confirmed_job_id=? AND status='confirmed' AND tenant_id=? AND phone_number_id=? AND sender=?",(job['id'],job['tenant_id'],job['phone_number_id'],job['sender'])).fetchone())
+        if (not ack or ack[0] not in _ACK_ACCEPTED) and not reviewed:
             return False
-        self._correction(job, "I received your PDF, but the automatic calculation could not be completed safely. Please review the app or contact the hotel administrator; no report will be sent automatically.")
+        self._correction(job, "The confirmed forecast calculation could not be completed safely. Please resend for a new review or contact the hotel administrator; no report was generated." if reviewed else "I received your PDF, but the automatic calculation could not be completed safely. Please review the app or contact the hotel administrator; no report will be sent automatically.")
         return True
 
     def _stage_ack(self, job, enrolled, rows, digest, source_key, settings):
@@ -297,6 +368,14 @@ class ForecastWorker:
             if not row:
                 return False
             item = dict(row)
+            if self.review_service is None:
+                queued_origin=db.execute('SELECT media_json FROM wa_jobs WHERE id=?',(item['job_id'],)).fetchone()
+                if queued_origin and '_forecast_review_id' in json.loads(queued_origin['media_json']):
+                    db.execute("UPDATE wa_outbox SET status='cancelled',error_code='review_disabled',updated_at=? WHERE id=?",(now,item['id']))
+                    return True
+            if self.review_service is not None and not self.review_service.prompt_dispatch_allowed(db,item,now):
+                db.execute("UPDATE wa_outbox SET status='cancelled',error_code='review_prompt_stale',updated_at=? WHERE id=?",(now,item['id']))
+                return True
             enrolled = self.store._enrollment(db, item["phone_number_id"], item["recipient"])
             if not enrolled or enrolled["tenant_id"] != item["tenant_id"]:
                 db.execute("UPDATE wa_outbox SET status='cancelled',error_code='enrollment_revoked',updated_at=? WHERE id=?", (now, item["id"]))

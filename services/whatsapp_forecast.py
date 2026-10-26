@@ -24,6 +24,7 @@ MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_PDF_PAGES = 10
 MAX_IMAGE_PIXELS = 40_000_000
 MAX_EXTRACTED_TEXT = 100_000
+MAX_PDF_PAGE_STREAM_BYTES = 2 * 1024 * 1024
 SUPPORTED_REPORT_PROFILES = frozenset({"canonical_v1", "hotel_daily_table_v1"})
 SUPPORTED_METRIC_LABELS = {
     "departures": "Departures",
@@ -38,6 +39,51 @@ SUPPORTED_METRIC_LABELS = {
 
 class ForecastNeedsCorrection(ValueError):
     """Safe, actionable explanation suitable for a same-sender correction reply."""
+
+
+class ForecastOCRRequired(ForecastNeedsCorrection):
+    """A scanned page needs local human-reviewed extraction, never auto-admission."""
+
+
+def _pdf_page_needs_visual_review(page):
+    """Reject image-backed/hidden-text PDF auto-admission conservatively.
+
+    A selectable OCR layer is not proof it matches the visible scan. Resource
+    traversal is bounded and does not decode raster images. Ordinary logos also
+    trigger review rather than risking a hidden contradictory forecast layer.
+    """
+    seen=set()
+    def resources(value,depth=0):
+        if depth>8 or len(seen)>128:
+            raise ForecastNeedsCorrection('The PDF resource structure is too complex for automatic processing.')
+        if hasattr(value,'get_object'):value=value.get_object()
+        if not value:return False
+        if id(value) in seen:return False
+        seen.add(id(value))
+        objects=value.get('/XObject',{})
+        if hasattr(objects,'get_object'):objects=objects.get_object()
+        for item in objects.values():
+            if hasattr(item,'get_object'):item=item.get_object()
+            if item.get('/Subtype')=='/Image':return True
+            # Forms can carry their own hidden text operators and clipping.
+            # This narrow native profile does not attempt to prove visibility
+            # through nested graphics programs; all Forms require review.
+            if item.get('/Subtype')=='/Form':return True
+        states=value.get('/ExtGState',{})
+        if hasattr(states,'get_object'):states=states.get_object()
+        for state in states.values():
+            if hasattr(state,'get_object'):state=state.get_object()
+            if any(float(state.get(key,1))<1 for key in ('/ca','/CA')):return True
+        return False
+    if resources(page.get('/Resources')):return True
+    content=page.get_contents()
+    if content is None:return False
+    if len(content.get_data())>MAX_PDF_PAGE_STREAM_BYTES:
+        raise ForecastNeedsCorrection('The PDF page is too complex for automatic processing.')
+    for operands,operator in content.operations:
+        if operator in {b'INLINE IMAGE',b'BI'}:return True
+        if operator==b'Tr' and operands and int(operands[0]) in {3,7}:return True
+    return False
 
 
 def _native_pdf_text(content: bytes) -> str:
@@ -59,9 +105,11 @@ def _native_pdf_text(content: bytes) -> str:
         for page in reader.pages:
             if page.get("/AA"):
                 raise ForecastNeedsCorrection("Please resend a plain forecast PDF without embedded actions.")
+            if _pdf_page_needs_visual_review(page):
+                raise ForecastOCRRequired('This PDF contains raster or hidden/transparent content. Its visible report must be reviewed; selectable text alone is not trusted.')
             text = page.extract_text() or ""
             if not text.strip():
-                raise ForecastNeedsCorrection("Scanned or unclear pages need review. Please resend the native-text forecast PDF, or review the file in the app.")
+                raise ForecastOCRRequired("Scanned or unclear pages need review. Please resend the native-text forecast PDF, or review the file in the app.")
             texts.append(text)
             if sum(map(len, texts)) > MAX_EXTRACTED_TEXT:
                 raise ForecastNeedsCorrection("The PDF is too complex for automatic processing. Please resend the standard forecast report only.")
@@ -72,7 +120,7 @@ def _native_pdf_text(content: bytes) -> str:
         raise ForecastNeedsCorrection("The PDF could not be read safely. Please resend a valid, unencrypted native-text forecast PDF.") from exc
 
 
-def _validate_image(content: bytes, mime_type: str) -> None:
+def _validate_image(content: bytes, mime_type: str, *, validate_only: bool = False) -> None:
     """Validate media before rejecting OCR; never run expensive OCR automatically."""
     from PIL import Image
 
@@ -90,7 +138,8 @@ def _validate_image(content: bytes, mime_type: str) -> None:
         raise
     except Exception as exc:
         raise ForecastNeedsCorrection("The image could not be read safely. Please resend the native-text forecast PDF.") from exc
-    raise ForecastNeedsCorrection("Photos and scanned forecasts need review before automatic scheduling. Please resend the native-text forecast PDF, or review and correct the file in the app.")
+    if not validate_only:
+        raise ForecastNeedsCorrection("Photos and scanned forecasts need review before automatic scheduling. Please resend the native-text forecast PDF, or review and correct the file in the app.")
 
 
 def _validate_explicit_identifiers(text: str, hotel_code: str, hotel_name: str | None) -> None:
@@ -250,6 +299,13 @@ def validate_whatsapp_forecast(
     if not data.startswith(b"%PDF-"):
         raise ForecastNeedsCorrection("The attachment does not match its PDF type. Please resend the original native-text forecast PDF.")
     text = _native_pdf_text(data)
+    return _validate_extracted_forecast_text(text,hotel_code,room_capacity,now,max_week_age_days,max_week_future_days,
+                                             report_profile=report_profile,hotel_name=hotel_name)
+
+
+def _validate_extracted_forecast_text(text,hotel_code,room_capacity,now,max_week_age_days=7,max_week_future_days=56,
+                                    *,report_profile='canonical_v1',hotel_name=None):
+    """Shared text checks; OCR callers must still require human source review."""
     if report_profile == "canonical_v1":
         _validate_template(text, hotel_code, hotel_name)
     else:
@@ -261,6 +317,26 @@ def validate_whatsapp_forecast(
         # extracted source prose. Keep the WhatsApp correction reply bounded.
         details = " ".join(errors[:3]) if errors else "The dates or numeric cells are ambiguous."
         raise ForecastNeedsCorrection("The forecast needs correction before scheduling. " + details + " Please resend the corrected standard PDF, or review it in the app.")
+    return validate_confirmed_forecast_rows(rows,room_capacity,now,max_week_age_days,max_week_future_days)
+
+
+def validate_confirmed_forecast_rows(rows,room_capacity,now,max_week_age_days=7,max_week_future_days=56):
+    """Recheck an explicit human-reviewed matrix against current saved limits.
+
+    Confirmation never authorizes missing counts, arithmetic errors, impossible
+    inventory or a stale week. Callers separately bind source/enrollment/revision.
+    """
+    from datetime import date
+    if (type(room_capacity) is not int or not 1<=room_capacity<=100_000 or not isinstance(now,datetime)
+            or any(type(value) is not int or value<0 for value in (max_week_age_days,max_week_future_days))):
+        raise ValueError('A saved capacity and reference clock are required')
+    if (not isinstance(rows,list) or len(rows)!=7 or any(not isinstance(row,dict) for row in rows)
+            or any(type(row.get(field)) not in {int,float} for row in rows for field in NUMERIC_FIELDS)
+            or any(not (type(row.get('date')) is date or (type(row.get('date')) is str and re.fullmatch(r'\d{4}-\d{2}-\d{2}',row['date']))) for row in rows)):
+        raise ForecastNeedsCorrection('The confirmed matrix needs seven explicit ISO dates and numeric cells; booleans or inferred values are not accepted.')
+    errors=validate_forecast(rows)
+    if errors:
+        raise ForecastNeedsCorrection('The confirmed matrix is incomplete or inconsistent. '+' '.join(errors[:3]))
     normalized = normalize_forecast_rows(rows)
     from datetime import date
 

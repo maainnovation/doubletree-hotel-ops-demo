@@ -289,6 +289,8 @@ def generate_weekly_roster(forecast_rows: list[dict[str, Any]], staff_payload: d
     return {"week_start": forecast[0]["date"], "week_end": forecast[-1]["date"], "forecast": forecast,
             "input_signature": _input_signature(inputs), "input_snapshot": inputs,
             "schedule": schedule, "constraints": constraints, "feasible": not infeasible,
+            "calculation_scope": {"all_stayovers_included": True, "inspection_buffer_in_weekly_demand": False,
+                                  "stayover_policy_text_filters_counts": False},
             "demand_minutes": {row["date"]: int(row["departures"] * float(clean["checkout_minutes"]) + row["stayovers"] * float(clean["stayover_minutes"])) for row in forecast},
             "hours_by_staff": {sid: round(hours, 2) for sid, hours in paid_total.items()}, "version": int((prior or {}).get("version", 0)) + 1}
 
@@ -416,6 +418,8 @@ def build_exports(roster: dict[str, Any]) -> tuple[bytes, bytes]:
     story.extend([table, Spacer(1, 8), cell("Times indicate scheduled SHIFT; * Preserved locked assignment. Paid hours and productive cleaning time differ; non-cleaning roles do not cover room-cleaning demand.", "SmallNote")])
     story.extend([PageBreak(), Paragraph("Day-by-day calculation summary", styles["Heading1"]),
                   cell("Calculated from this version's saved forecast, staff availability, and settings. Arrivals are not additional checkout cleans. Required headcount rounds up a standard productive shift; eligibility, hour limits, and locks still apply.", "SummaryCell"), Spacer(1, 10)])
+    story.append(cell("Calculation scope: all forecast stayovers are counted. Stayover-policy text is descriptive, not a filtering rule. The final inspection buffer is not included in this weekly cleaning-demand calculation.", "SmallNote"))
+    story.append(Spacer(1, 8))
     if summary:
         calculations = [["Day", "Cleaning workload (minutes)", "Required / scheduled", "Coverage / attention"]]
         for day in summary:

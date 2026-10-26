@@ -147,6 +147,12 @@ class PrivateFileStore:
 class WorkflowStore(StateStore):
     development_only = True
 
+    @staticmethod
+    def _review_command(body):
+        if not isinstance(body,str) or len(body)>64:return None
+        match=re.fullmatch(r'(CONFIRM|CANCEL)\s+([0-9a-fA-F]{16})',body.strip(),re.I)
+        return {'type':'review_command','command':match.group(1).upper(),'review_code':match.group(2).lower()} if match else None
+
     def __init__(self, path=None):
         super().__init__(path)
         os.chmod(self.path, 0o600)
@@ -260,6 +266,9 @@ class WorkflowStore(StateStore):
                             continue
                         kind = message.get("type")
                         media = {"type": "unsupported"}
+                        if kind=='text':
+                            review=self._review_command(message.get('text',{}).get('body')) if isinstance(message.get('text'),dict) else None
+                            if review:media.update(review)
                         if kind in {"document", "image"}:
                             source = message.get(kind, {})
                             if not isinstance(source, dict):
@@ -311,6 +320,9 @@ class WorkflowStore(StateStore):
                 if not isinstance(max_jobs, int) or isinstance(max_jobs, bool) or not 1 <= max_jobs <= 100 or db.execute("SELECT COUNT(*) FROM wa_jobs").fetchone()[0] >= max_jobs:
                     raise ValueError("Pilot intake limit reached")
             media = {"type": "unsupported", "_provider": "twilio"}
+            if form.get('NumMedia')=='0':
+                review=self._review_command(form.get('Body'))
+                if review:media.update(review)
             if form.get("NumMedia") == "1":
                 url, mime = form.get("MediaUrl0", ""), form.get("MediaContentType0", "")
                 expected = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages/{message_id}/Media/"
@@ -384,9 +396,12 @@ class WorkflowStore(StateStore):
             exhausted = db.execute("SELECT * FROM wa_jobs WHERE status='processing' AND lease_until<? AND attempts>=5+ack_base_attempts AND (? IS NULL OR phone_number_id=?) AND (?=0 OR phone_number_id NOT LIKE 'twilio:%')", (now,phone_number_id,phone_number_id,exclude_twilio)).fetchall()
             for stale in exhausted:
                 ack = db.execute("SELECT status FROM wa_outbox WHERE job_id=? AND purpose='ack'", (stale['id'],)).fetchone()
-                if ack and ack['status'] in {'accepted','sent','delivered','read'}:
+                reviewed=False
+                if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='wa_forecast_reviews'").fetchone():
+                    reviewed=bool(db.execute("SELECT 1 FROM wa_forecast_reviews WHERE confirmed_job_id=? AND status='confirmed' AND tenant_id=? AND phone_number_id=? AND sender=?",(stale['id'],stale['tenant_id'],stale['phone_number_id'],stale['sender'])).fetchone())
+                if (ack and ack['status'] in {'accepted','sent','delivered','read'}) or reviewed:
                     if not db.execute("SELECT 1 FROM wa_outbox WHERE job_id=? AND purpose='result'", (stale['id'],)).fetchone():
-                        self.add_outbox(db, stale, now, "I received your PDF, but the automatic calculation could not be completed safely. Please review the app or contact the hotel administrator; no report will be sent automatically.")
+                        self.add_outbox(db, stale, now, "The confirmed forecast calculation could not be completed safely. Please resend for a new review or contact the hotel administrator; no report was generated." if reviewed else "I received your PDF, but the automatic calculation could not be completed safely. Please review the app or contact the hotel administrator; no report will be sent automatically.")
                     terminal = 'needs_correction'
                 else:
                     terminal = 'failed'
