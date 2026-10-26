@@ -179,3 +179,38 @@ def test_nested_form_hidden_text_cannot_bypass_review(monkeypatch):
     result=evaluate(out.getvalue())
     assert not result['automatic_roster_allowed'] and result['requires_review']
     with pytest.raises(ForecastNeedsCorrection):validate_whatsapp_forecast(out.getvalue(),'application/pdf','SYNTHETIC-HOTEL',200,NOW)
+
+
+@pytest.mark.parametrize('kind',['png','jpeg','scan'])
+def test_ocr_intermediates_are_closed_without_changing_output_pixels(monkeypatch,kind):
+    from PIL import ImageOps
+    from services.forecast_media_review import _ocr_image
+    data,mime=(scanned_pdf(),'application/pdf') if kind=='scan' else (image_bytes('JPEG' if kind=='jpeg' else 'PNG'),'image/'+kind)
+    with _ocr_image(data,mime) as reference:
+        expected=(reference.size,reference.mode,reference.tobytes())
+    original_gray,original_contrast=ImageOps.grayscale,ImageOps.autocontrast
+    retained={}
+    def gray(image):
+        retained['rgb']=image
+        result=original_gray(image);retained['gray']=result
+        return result
+    def contrast(image):
+        # The larger RGB buffer must already be released while contrast runs.
+        with pytest.raises(ValueError):retained['rgb'].getpixel((0,0))
+        return original_contrast(image)
+    monkeypatch.setattr(ImageOps,'grayscale',gray)
+    monkeypatch.setattr(ImageOps,'autocontrast',contrast)
+    with _ocr_image(data,mime) as result:
+        assert (result.size,result.mode,result.tobytes())==expected
+        with pytest.raises(ValueError):retained['gray'].getpixel((0,0))
+
+
+def test_ocr_source_image_is_closed_even_if_pass_adapter_raises(monkeypatch):
+    seen=[]
+    def fail(image):
+        seen.append(image)
+        raise RuntimeError('synthetic adapter error')
+    monkeypatch.setattr('services.forecast_media_review._ocr_passes',fail)
+    with pytest.raises(RuntimeError,match='synthetic adapter'):
+        evaluate(image_bytes(),'image/png')
+    with pytest.raises(ValueError):seen[0].getpixel((0,0))

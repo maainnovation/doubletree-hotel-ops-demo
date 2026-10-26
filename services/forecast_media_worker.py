@@ -256,6 +256,9 @@ def _child_main() -> int:
         if len(raw) > MAX_REQUEST_BYTES:
             raise ValueError
         request = json.loads(raw)
+        # The bounded transport envelope is not source evidence. Release its
+        # base64/JSON copy before native rendering/OCR allocates image buffers.
+        del raw
         content = base64.b64decode(request.pop("data"), validate=True)
         request["now"] = datetime.fromisoformat(request["now"])
         # Current PyMuPDF distributions may auto-load an optional ONNX layout

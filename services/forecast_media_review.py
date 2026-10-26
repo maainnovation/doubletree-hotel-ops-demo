@@ -78,6 +78,9 @@ def _ocr_image(data,mime_type):
                     raise ValueError
                 pixels=page.get_pixmap(matrix=pymupdf.Matrix(scale,scale),alpha=False)
                 image=Image.frombytes('RGB',(pixels.width,pixels.height),pixels.samples)
+                # frombytes owns an independent copy; the native raster is no
+                # longer needed. Do not retain both through grayscale/OCR.
+                del pixels
         except ForecastNeedsCorrection:
             raise
         except Exception as exc:
@@ -85,8 +88,17 @@ def _ocr_image(data,mime_type):
     scale=min(1.5,MAX_WORKING_EDGE/max(image.size),math.sqrt(MAX_WORKING_PIXELS/(image.width*image.height)))
     size=tuple(max(1,round(value*scale)) for value in image.size)
     if size!=image.size:
-        image=image.resize(size,Image.Resampling.LANCZOS)
-    return ImageOps.autocontrast(ImageOps.grayscale(image))
+        resized=image.resize(size,Image.Resampling.LANCZOS)
+        image.close()
+        image=resized
+    try:
+        gray=ImageOps.grayscale(image)
+    finally:
+        image.close()
+    try:
+        return ImageOps.autocontrast(gray)
+    finally:
+        gray.close()
 
 
 def _ocr_passes(image):
@@ -154,7 +166,10 @@ def evaluate_forecast_media(data,mime_type,hotel_code,room_capacity,now,*,report
                           automatic_roster_allowed=bool(rows and not issues),requires_review=not bool(rows and not issues))
             return result
     image=_ocr_image(data,mime_type)
-    passes=_ocr_passes(image)
+    try:
+        passes=_ocr_passes(image)
+    finally:
+        image.close()
     candidates=[]; all_issues=[]
     for evidence in passes:
         text=evidence.pop('text')
